@@ -156,3 +156,18 @@ test "Theorem 80: reconcile endpoint equals a from-scratch load" {
     try std.testing.expect(!incremental.orch.isProvided(Key.of(u32, "x")));
     try std.testing.expect(!scratch.orch.isProvided(Key.of(u32, "x")));
 }
+
+fn loaderScenario(allocator: std.mem.Allocator) !void {
+    var loader = try Loader.init(allocator);
+    defer loader.deinit();
+    try loader.reconcile(&.{.{ .name = "a", .component = provider("a", 1) }});
+    try loader.reconcile(&.{
+        .{ .name = "a", .component = provider("a", 1) },
+        .{ .name = "b", .component = provider("b", 2) },
+    });
+    try loader.reconcile(&.{.{ .name = "b", .component = provider("b", 2) }}); // drop a
+}
+
+test "OOM safety: full reconcile scenario leaks nothing on any failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, loaderScenario, .{});
+}
