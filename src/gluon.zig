@@ -30,6 +30,13 @@ pub const spec = @import("coeffect/spec.zig");
 pub const Spec = spec.Spec;
 pub const Classification = spec.Classification;
 
+pub const component = @import("component/component.zig");
+pub const Component = component.Component;
+pub const Fiber = component.Fiber;
+pub const FiberId = component.FiberId;
+pub const Phase = component.Phase;
+pub const View = component.View;
+
 test {
     // Pull in referenced modules' tests.
     _ = accumulator;
@@ -39,4 +46,5 @@ test {
     _ = store;
     _ = context;
     _ = spec;
+    _ = component;
 }
