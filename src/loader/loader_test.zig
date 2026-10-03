@@ -4,56 +4,16 @@
 const std = @import("std");
 const loader_mod = @import("loader.zig");
 const comp = @import("../component/component.zig");
-const Context = @import("../context/context.zig").Context;
-const effect_iter = @import("../effect/effect_iter.zig");
 const store_mod = @import("../coeffect/store.zig");
+const fixtures = @import("../testing/fixtures.zig");
 
 const Loader = loader_mod.Loader;
 const Component = comp.Component;
 const ConfigEntry = loader_mod.ConfigEntry;
 const Key = store_mod.Key;
 
-// A provider component that provisions `key := value`.
-fn providerApply(comptime key_name: []const u8, comptime value: u32) comp.Apply {
-    const Impl = struct {
-        const k = Key.of(u32, key_name);
-        fn apply(ctx: *Context, _: ?*anyopaque) anyerror!Context.Iterator {
-            const Iter = struct {
-                fn make(a: std.mem.Allocator) !Context.Iterator {
-                    const self = try a.create(@This());
-                    self.* = .{};
-                    return .{ .state = self, .next_fn = next, .deinit_fn = deinit };
-                }
-                fn next(_: *anyopaque, a: std.mem.Allocator, c: *Context) anyerror!effect_iter.Step(Context) {
-                    try c.store.set(u32, k, value);
-                    const kb = try a.create(Key);
-                    kb.* = k;
-                    const Inv = struct {
-                        fn call(s: *anyopaque, cc: *Context) void {
-                            cc.store.restrict(@as(*Key, @ptrCast(@alignCast(s))).*) catch {};
-                        }
-                        fn dfn(s: *anyopaque, aa: std.mem.Allocator) void {
-                            aa.destroy(@as(*Key, @ptrCast(@alignCast(s))));
-                        }
-                    };
-                    return .{ .inverse = .{ .state = kb, .call = Inv.call, .deinit = Inv.dfn }, .done = true };
-                }
-                fn deinit(s: *anyopaque, a: std.mem.Allocator) void {
-                    a.destroy(@as(*@This(), @ptrCast(@alignCast(s))));
-                }
-            };
-            return Iter.make(ctx.allocator);
-        }
-    };
-    return Impl.apply;
-}
-
-fn provider(comptime key_name: []const u8, comptime value: u32) Component {
-    const S = struct {
-        const k = [_]Key{Key.of(u32, key_name)};
-    };
-    return .{ .inject = &.{}, .provide = &S.k, .apply = providerApply(key_name, value) };
-}
+// Shared component factories live in src/testing/fixtures.zig.
+const provider = fixtures.provider;
 
 test "§5.2.1 reconcile: a new enabled entry is loaded and activated" {
     var loader = try Loader.init(std.testing.allocator);
