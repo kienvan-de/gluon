@@ -26,6 +26,10 @@ pub const Key = store.Key;
 pub const context = @import("context/context.zig");
 pub const Context = context.Context;
 
+pub const spec = @import("coeffect/spec.zig");
+pub const Spec = spec.Spec;
+pub const Classification = spec.Classification;
+
 test {
     // Pull in referenced modules' tests.
     _ = accumulator;
@@ -34,4 +38,5 @@ test {
     _ = type_id;
     _ = store;
     _ = context;
+    _ = spec;
 }
