@@ -226,12 +226,23 @@ purely additive.
   teardown awaiting departing dependencies). Synchronous model remains valid as
   the degenerate schedule.
 
-**7. Realm freeze at fiber insertion (§4.4 Isolation)** — ★★★★☆ readiness, low urgency
+**7. Realm freeze at fiber insertion (§4.4 Isolation)** — ✅✅ **ADOPTED (2026-10)**
 - Freeze a fiber's `ρ` at insertion so realm reassignment becomes a revision
   (new fiber), fixing the documented set-inverse-resolves-at-recover-time
   limitation. Pure Zig, but only meaningful once multi-realm multi-tenancy is
   actually used.
 - *Value:* Low now; higher if multi-tenancy is pursued.
+- **Shipped:** realized at the effect level (equivalent to a per-fiber ρ freeze
+  for the provision path, which is where the bug lived). `Store.restrictRealm`
+  withdraws an EXPLICIT realm, bypassing live ρ; `ctx.set` now resolves ρ(k)
+  ONCE at set time and freezes it into the restriction inverse, so a later
+  `isolate()` can no longer make the inverse withdraw the wrong binding — the
+  inverse undoes exactly what the set did (Def 20 inverse, Thm 7). The former
+  `KNOWN LIMITATION` test is replaced by a passing §4.4-Isolation test; +3 new
+  tests (store `restrictRealm`, context realm-freeze property, OOM), 134 total
+  Debug + ReleaseSafe. Note: test fixtures that build their own set-inverses
+  bind under the default realm and never reassign ρ, so they are unaffected;
+  the general `ctx.set` path is the one that needed the fix.
 
 ### Tier 4 — Not Zig-expressible / out of scope
 

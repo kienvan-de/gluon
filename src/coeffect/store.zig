@@ -121,9 +121,21 @@ pub const Store = struct {
         return @as(*V, @ptrCast(@alignCast(sv.ptr))).*;
     }
 
-    /// The inverse of set: remove the binding at ρ(k) (σ ∖ ρ(k)).
+    /// The inverse of set: remove the binding at ρ(k) (σ ∖ ρ(k)). Resolves the
+    /// realm through the LIVE ρ at call time — correct only while ρ(k) is
+    /// stable between set and restrict. The frozen-realm inverse used by
+    /// ctx.set captures the realm at set time and calls `restrictRealm`
+    /// instead (§4.4 Isolation: a fiber's realms are fixed at insertion).
     pub fn restrict(self: *Store, key: Key) !void {
-        const realm = self.resolveRealm(key);
+        return self.restrictRealm(self.resolveRealm(key));
+    }
+
+    /// Remove the binding at an EXPLICIT realm (σ ∖ realm), bypassing ρ. This
+    /// is the realm-frozen inverse: given the realm a prior `set` resolved to,
+    /// it withdraws exactly that binding regardless of later ρ reassignment,
+    /// so an effect's inverse undoes precisely what the effect did (Def 20
+    /// inverse, Theorem 7). Used by ctx.set to realize §4.4's fixed-ρ semantics.
+    pub fn restrictRealm(self: *Store, realm: Realm) !void {
         const entry = self.values.fetchRemove(realm) orelse return StoreError.NotProvided;
         entry.value.deinit(entry.value.ptr, self.allocator);
     }
@@ -206,4 +218,21 @@ test "Definition 24/25: isolation redirects a key to an independent binding" {
     // Re-point to the original realm: the first value is still there.
     try store.isolate(k, "db");
     try std.testing.expectEqual(@as(u32, 100), try store.get(u32, k));
+}
+
+test "restrictRealm withdraws an explicit realm regardless of live ρ (#7)" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    const k = Key.of(u32, "x");
+    const bound_realm = store.resolveRealm(k); // "x" (default realm)
+    try store.set(u32, k, 1);
+
+    // Reassign ρ(k) to "other" AFTER binding. restrict(k) would now target
+    // "other" (live ρ) and miss; restrictRealm(bound_realm) hits the exact
+    // binding the set made.
+    try store.isolate(k, "other");
+    try std.testing.expectError(StoreError.NotProvided, store.restrict(k)); // live ρ misses
+    try store.restrictRealm(bound_realm); // frozen realm hits
+    try std.testing.expect(!store.values.contains("x")); // withdrawn, not orphaned
 }

@@ -109,20 +109,27 @@ pub const Context = struct {
     /// (Definition 20), this installs the value AND tracks its restriction
     /// inverse onto this context's accumulator, so recover withdraws it.
     pub fn set(self: *Self, comptime V: type, key: Key, value: V) !void {
+        // Resolve ρ(k) ONCE, at set time, and freeze it into the inverse (§4.4
+        // Isolation: a fiber's realms are fixed for its lifecycle). The inverse
+        // restricts exactly this realm, so a later isolate() cannot make it
+        // withdraw the wrong binding — the inverse undoes precisely what the
+        // set did (Def 20 inverse, Theorem 7).
+        const realm = self.store.resolveRealm(key);
         try self.store.set(V, key, value);
-        errdefer self.store.restrict(key) catch {};
+        errdefer self.store.restrictRealm(realm) catch {};
 
-        // The inverse: restrict the key, undoing this provision.
-        const inv_state = try self.allocator.create(Key);
+        // The inverse: restrict the FROZEN realm, undoing this provision.
+        const State = struct { realm: store_mod.Realm };
+        const inv_state = try self.allocator.create(State);
         errdefer self.allocator.destroy(inv_state);
-        inv_state.* = key;
+        inv_state.* = .{ .realm = realm };
         const Impl = struct {
             fn call(state: *anyopaque, ctx: *Self) void {
-                const k: *Key = @ptrCast(@alignCast(state));
-                ctx.store.restrict(k.*) catch {};
+                const s: *State = @ptrCast(@alignCast(state));
+                ctx.store.restrictRealm(s.realm) catch {};
             }
             fn deinit(state: *anyopaque, allocator: std.mem.Allocator) void {
-                allocator.destroy(@as(*Key, @ptrCast(@alignCast(state))));
+                allocator.destroy(@as(*State, @ptrCast(@alignCast(state))));
             }
         };
         // On track failure: errdefers unwind the store binding and inv_state.
@@ -479,30 +486,51 @@ test "ctx.isolate redirects a key through the shared store" {
     try std.testing.expectEqual(@as(u32, 20), try ctx.get(u32, k));
 }
 
-test "KNOWN LIMITATION: set-inverse resolves realm at recover time, not set time" {
-    // This documents a semantics subtlety. ctx.set tracks an inverse that
-    // restricts `key`; restrict re-resolves ρ(key) when it RUNS. If the realm
-    // is reassigned between set and recover, the inverse targets the new
-    // realm. The paper (§4.4 Isolation) fixes a fiber's realms at insertion
-    // and treats a runtime realm change as a revision, so within one fiber's
-    // lifecycle ρ is stable and this cannot occur. We assert the current
-    // behavior so a future fiber-level realm freeze is a deliberate change.
+test "§4.4 Isolation (realm freeze): set-inverse withdraws the realm it bound" {
+    // Each ctx.set freezes ρ(k) at set time into its inverse (roadmap #7). So
+    // even if the realm is reassigned between sets, every inverse restricts
+    // exactly the realm its own set bound — the effect's inverse undoes
+    // precisely what the effect did (Def 20 inverse, Theorem 7). This replaces
+    // the former KNOWN LIMITATION, which left an orphaned binding.
     const ctx = try Context.init(std.testing.allocator);
     defer ctx.deinit();
 
     const k = Key.of(u32, "x");
-    try ctx.set(u32, k, 1); // realm "x", inverse tracked
+    try ctx.set(u32, k, 1); // binds realm "x"; inverse frozen on "x"
     try ctx.isolate(k, "other"); // ρ(x) = "other"
-    try ctx.set(u32, k, 2); // realm "other", inverse tracked
+    try ctx.set(u32, k, 2); // binds realm "other"; inverse frozen on "other"
 
-    // Both inverses now resolve ρ(k) = "other" at recover time. The first
-    // restrict removes "other"; the second finds nothing (restrict is
-    // tolerant via `catch {}`), leaving realm "x" still bound.
+    // Recover withdraws BOTH realms (LIFO: "other" then "x") — nothing orphaned.
     ctx.dispose.recover(ctx);
-    try ctx.isolate(k, "x");
-    try std.testing.expectEqual(@as(u32, 1), try ctx.get(u32, k)); // "x" survived
-    // Clean up the leaked "x" binding so the allocator reports no leak.
-    try ctx.store.restrict(k);
+    try std.testing.expect(!ctx.store.values.contains("x")); // "x" withdrawn
+    try std.testing.expect(!ctx.store.values.contains("other")); // "other" withdrawn
+}
+
+test "§4.4 realm freeze: reassigning ρ after set still lets recover withdraw it" {
+    // The minimal #7 property: bind under the default realm, reassign ρ, then
+    // recover — the binding must be withdrawn (the inverse froze the realm at
+    // set time). Previously this orphaned the binding (the KNOWN LIMITATION).
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const k = Key.of(u32, "tenant");
+    try ctx.set(u32, k, 7); // binds realm "tenant"
+    try ctx.isolate(k, "realm-B"); // ρ(tenant) = "realm-B" after the fact
+    ctx.dispose.recover(ctx);
+    try std.testing.expect(!ctx.store.values.contains("tenant")); // not orphaned
+}
+
+fn realmFreezeUnderOom(allocator: std.mem.Allocator) !void {
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+    const k = Key.of(u32, "x");
+    try ctx.set(u32, k, 1);
+    try ctx.isolate(k, "other");
+    try ctx.set(u32, k, 2);
+}
+
+test "OOM safety: frozen-realm set-inverse leaks nothing on any failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, realmFreezeUnderOom, .{});
 }
 
 // ── Effect method + child contexts ────────────────────────────
