@@ -179,11 +179,22 @@ purely additive.
   realized config and frees it on teardown/replace/deinit. 15 new tests (schema
   unit + config-driven reconcile + OOM), 114 total passing Debug + ReleaseSafe.
 
-**5. Comptime-typed service accessors** — ★★★☆☆
+**5. Comptime-typed service accessors** — ✅✅ **ADOPTED (2026-10)**
 - Generate typed accessors from a comptime key registry so call sites read
   `ctx.get(DbKey)` with the type inferred. Zig has no `Proxy`/declaration
   merging, so we get typed-but-explicit, not Cordis's transparent `ctx.database`.
 - *Value:* Medium.
+- **Shipped:** `src/context/typed_key.zig` — `TypedKey(V, name)` carries V at
+  comptime and lowers to the same `store.Key`. Context accessors `getT`/`setT`/
+  `hasT`/`getInterceptedT` read `V = K.Value` off the key, so the call site
+  never restates the type — and `setT(K, value)` types `value` as `K.Value`, so
+  a mismatch is a COMPILE error (vs the untyped `set`'s runtime TypeMismatch).
+  Pure ergonomics, zero overhead (K.key is comptime), fully interoperable with
+  the untyped accessors on the same binding. No new store semantics. 7 new
+  tests (typed_key unit + context integration), 121 total passing Debug +
+  ReleaseSafe. This is the closest Zig gets to Cordis's transparent
+  `ctx.service` — typed-but-explicit; Tier-4 #8 (true Proxy access) remains
+  impossible in Zig.
 
 ### Tier 3 — Newly ready in 0.16 · stabilizing (churn risk)
 

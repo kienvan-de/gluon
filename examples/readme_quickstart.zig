@@ -118,3 +118,17 @@ test "README quickstart: events as revertible effects" {
     ctx.dispose.recover(ctx);
     try std.testing.expectEqual(@as(usize, 0), bus.emit(u32, "tick", &one));
 }
+
+// Typed accessors: a TypedKey carries its value type, so get/set/has infer it.
+// Typed-but-explicit — the closest Zig gets to Cordis's transparent ctx.service
+// (Zig has no Proxy / declaration merging).
+const DbPort = gluon.TypedKey(u32, "db.port.typed");
+
+test "README quickstart: typed service accessors" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    try ctx.setT(DbPort, 5432); // value type inferred from the key (u32)
+    try std.testing.expect(ctx.hasT(DbPort));
+    try std.testing.expectEqual(@as(u32, 5432), try ctx.getT(DbPort));
+}

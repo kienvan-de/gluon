@@ -25,10 +25,12 @@ const effect_iter = @import("../effect/effect_iter.zig");
 const store_mod = @import("../coeffect/store.zig");
 const interception = @import("../coeffect/interception.zig");
 const event_bus = @import("../event/bus.zig");
+const typed_key = @import("typed_key.zig");
 
 pub const Key = store_mod.Key;
 pub const Store = store_mod.Store;
 pub const StoreError = store_mod.StoreError;
+pub const TypedKey = typed_key.TypedKey;
 pub const EventBus = event_bus.EventBus;
 pub const Handler = event_bus.Handler;
 pub const Subscription = event_bus.Subscription;
@@ -132,6 +134,32 @@ pub const Context = struct {
         return self.store.has(key);
     }
 
+    // ── Typed accessors (roadmap #5): V inferred from a TypedKey ─────
+    //
+    // `K` is a TypedKey(V, name) *type*; these read V = K.Value off it, so the
+    // call site never restates the type. Pure ergonomics over get/set/has —
+    // same store, same inverse tracking, zero overhead (K.key is comptime).
+
+    /// ctx.getT(TypedKey) — typed get: V is K.Value (Definition 20).
+    pub fn getT(self: *Self, comptime K: type) !K.Value {
+        comptime std.debug.assert(typed_key.isTypedKey(K));
+        return self.get(K.Value, K.key);
+    }
+
+    /// ctx.setT(TypedKey, value) — typed, revertible provision (Definition 20).
+    /// `value` is typed as K.Value, so a mismatch is a compile error (not a
+    /// runtime TypeMismatch).
+    pub fn setT(self: *Self, comptime K: type, value: K.Value) !void {
+        comptime std.debug.assert(typed_key.isTypedKey(K));
+        return self.set(K.Value, K.key, value);
+    }
+
+    /// ctx.hasT(TypedKey) — whether the key resolves in Σ.
+    pub fn hasT(self: *const Self, comptime K: type) bool {
+        comptime std.debug.assert(typed_key.isTypedKey(K));
+        return self.store.has(K.key);
+    }
+
     /// ctx.isolate(key, realm) — Definition 25. Derived realization: adjusts ρ
     /// with nothing to track on σ (recovery discards the adjustment with the
     /// context). Acts on the shared store, so a child context sees it too.
@@ -232,6 +260,17 @@ pub const Context = struct {
 
         const value = try provider.apply(self.allocator, merged);
         return .{ .value = @ptrCast(@alignCast(value)), .free = provider.free };
+    }
+
+    /// ctx.getInterceptedT(TypedKey, declared) — typed Definition 27 get: V is
+    /// K.Value, inferred from the key.
+    pub fn getInterceptedT(
+        self: *Self,
+        comptime K: type,
+        declared: ?*anyopaque,
+    ) !interception.Resolved(K.Value) {
+        comptime std.debug.assert(typed_key.isTypedKey(K));
+        return self.getIntercepted(K.Value, K.key, declared);
     }
 
     // ── Events (§3.4.2 tagged registry; Def 8 revertible effect) ─────
@@ -369,6 +408,39 @@ test "ctx.set installs a binding and ctx.get reads it" {
     try ctx.set(u32, k, 42);
     try std.testing.expect(ctx.has(k));
     try std.testing.expectEqual(@as(u32, 42), try ctx.get(u32, k));
+}
+
+// ── Typed accessors (roadmap #5): V inferred from a TypedKey ──────
+
+const DbPort = TypedKey(u32, "db.port");
+
+test "typed accessors: setT/getT/hasT infer V from the key" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    try std.testing.expect(!ctx.hasT(DbPort));
+    try ctx.setT(DbPort, 5432); // no type restated; 5432 is u32 by inference
+    try std.testing.expect(ctx.hasT(DbPort));
+    try std.testing.expectEqual(@as(u32, 5432), try ctx.getT(DbPort));
+}
+
+test "typed and untyped accessors interoperate on the same binding" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    // Set via the typed accessor, read via the untyped one (same lowered Key).
+    try ctx.setT(DbPort, 99);
+    try std.testing.expectEqual(@as(u32, 99), try ctx.get(u32, Key.of(u32, "db.port")));
+    try std.testing.expect(ctx.has(DbPort.key));
+}
+
+test "typed accessor set is revertible like the untyped one" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+    try ctx.setT(DbPort, 1);
+    try std.testing.expect(ctx.hasT(DbPort));
+    ctx.dispose.recover(ctx); // withdraws the typed provision
+    try std.testing.expect(!ctx.hasT(DbPort));
 }
 
 test "Definition 20: ctx.set is a revertible effect — recover withdraws it" {

@@ -31,6 +31,9 @@ pub const Handler = event_bus.Handler;
 pub const Subscription = event_bus.Subscription;
 pub const busWitness = event_bus.busWitness;
 
+pub const typed_key = @import("context/typed_key.zig");
+pub const TypedKey = typed_key.TypedKey;
+
 pub const context = @import("context/context.zig");
 pub const Context = context.Context;
 
@@ -80,6 +83,7 @@ test {
     _ = effect_iter;
     _ = type_id;
     _ = store;
+    _ = typed_key;
     _ = event_bus;
     _ = context;
     _ = spec;
