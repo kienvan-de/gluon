@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const acc = @import("../effect/accumulator.zig");
+const effect_iter = @import("../effect/effect_iter.zig");
 const store_mod = @import("../coeffect/store.zig");
 
 pub const Key = store_mod.Key;
@@ -111,6 +112,63 @@ pub const Context = struct {
     pub fn isolate(self: *Self, key: Key, realm: store_mod.Realm) !void {
         try self.store.isolate(key, realm);
     }
+
+    // ── Effect tracking (§5.1.1) ─────────────────────────────
+
+    pub const Iterator = effect_iter.Iterator(Self);
+    pub const Guard = effect_iter.Guard;
+
+    /// ctx.effect(iter, guard) — Algorithm 1. Drive an effect iterator to
+    /// completion (or until `guard` trips), tracking every yielded inverse onto
+    /// THIS context's accumulator. After this returns, ctx.dispose holds the
+    /// composite recover for the installed effects (LIFO, Theorem 16).
+    ///
+    /// This is the sole mutation primitive of §5.1.1: ctx.set is a special case
+    /// (a single-step provision effect), and component instantiation (Alg 4)
+    /// will likewise reduce to a ctx.effect call.
+    pub fn effect(self: *Self, iter: Iterator, guard: Guard) !void {
+        return effect_iter.execute(Self, iter, guard, self.allocator, self, &self.dispose);
+    }
+
+    // ── Derived child contexts (§5.1.1 parent composition, ∂²Γ) ──────
+
+    /// Derive a child context sharing this context's store. The child keeps its
+    /// own accumulator; disposing the child recovers only the child's effects.
+    /// A child's dispose is prepended to the parent's accumulator (§5.1.1
+    /// "parent composition"): unloading the parent cascades to the child, which
+    /// is the recursive ∂²Γ structure of Definition 28.
+    ///
+    /// The returned child is owned by the parent after this call: the parent's
+    /// accumulator holds the inverse that disposes and destroys it.
+    pub fn derive(self: *Self) !*Self {
+        const child = try self.allocator.create(Self);
+        child.* = .{
+            .allocator = self.allocator,
+            .store = self.store, // shared by reference
+            .owns_store = false,
+            .dispose = Accumulator.init(self.allocator),
+            .parent = self,
+        };
+
+        // Prepend the child's teardown to the parent's accumulator: when the
+        // parent recovers, it recovers the child's effects then frees it.
+        const Impl = struct {
+            fn call(state: *anyopaque, _: *Self) void {
+                const c: *Self = @ptrCast(@alignCast(state));
+                c.dispose.recover(c);
+            }
+            fn deinit(state: *anyopaque, allocator: std.mem.Allocator) void {
+                // Runs after `call` (or on drop): free the child shell. Its
+                // accumulator is already empty after recover; if dropped
+                // without recover, release remaining inverses first.
+                const c: *Self = @ptrCast(@alignCast(state));
+                c.dispose.deinit();
+                allocator.destroy(c);
+            }
+        };
+        try self.dispose.track(.{ .state = child, .call = Impl.call, .deinit = Impl.deinit });
+        return child;
+    }
 };
 
 // ───────────────────────────── Tests ─────────────────────────────
@@ -185,4 +243,79 @@ test "KNOWN LIMITATION: set-inverse resolves realm at recover time, not set time
     try std.testing.expectEqual(@as(u32, 1), try ctx.get(u32, k)); // "x" survived
     // Clean up the leaked "x" binding so the allocator reports no leak.
     try ctx.store.restrict(k);
+}
+
+// ── Effect method + child contexts ────────────────────────────
+
+/// A one-step iterator that provisions `key := value` and yields a restrict
+/// inverse. Exercises ctx.effect driving a generic effect (not just ctx.set).
+const ProvideIter = struct {
+    key: Key,
+    value: u32,
+
+    fn make(allocator: std.mem.Allocator, key: Key, value: u32) !Context.Iterator {
+        const self = try allocator.create(ProvideIter);
+        self.* = .{ .key = key, .value = value };
+        return .{ .state = self, .next_fn = nextFn, .deinit_fn = deinitFn };
+    }
+    fn nextFn(state: *anyopaque, allocator: std.mem.Allocator, ctx: *Context) anyerror!effect_iter.Step(Context) {
+        const self: *ProvideIter = @ptrCast(@alignCast(state));
+        try ctx.store.set(u32, self.key, self.value);
+        const inv_key = try allocator.create(Key);
+        inv_key.* = self.key;
+        const Impl = struct {
+            fn call(s: *anyopaque, c: *Context) void {
+                c.store.restrict(@as(*Key, @ptrCast(@alignCast(s))).*) catch {};
+            }
+            fn deinit(s: *anyopaque, a: std.mem.Allocator) void {
+                a.destroy(@as(*Key, @ptrCast(@alignCast(s))));
+            }
+        };
+        return .{ .inverse = .{ .state = inv_key, .call = Impl.call, .deinit = Impl.deinit }, .done = true };
+    }
+    fn deinitFn(state: *anyopaque, allocator: std.mem.Allocator) void {
+        allocator.destroy(@as(*ProvideIter, @ptrCast(@alignCast(state))));
+    }
+};
+
+test "ctx.effect drives an iterator and tracks its inverse (Alg 1)" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const k = Key.of(u32, "port");
+    const iter = try ProvideIter.make(ctx.allocator, k, 8080);
+    defer iter.deinit(ctx.allocator);
+
+    try ctx.effect(iter, Context.Guard.always());
+    try std.testing.expectEqual(@as(u32, 8080), try ctx.get(u32, k));
+
+    ctx.dispose.recover(ctx);
+    try std.testing.expect(!ctx.has(k)); // inverse withdrew the provision
+}
+
+test "§5.1.1 parent composition: disposing parent recovers child effects" {
+    const parent = try Context.init(std.testing.allocator);
+    defer parent.deinit();
+
+    const child = try parent.derive();
+    // Child and parent share the store.
+    try std.testing.expect(child.store == parent.store);
+
+    const ck = Key.of(u32, "child.key");
+    try child.set(u32, ck, 1);
+    try std.testing.expect(parent.has(ck)); // visible through shared store
+
+    // Recovering the PARENT cascades to the child: the child's binding is
+    // withdrawn and the child shell is freed (no leak reported).
+    parent.dispose.recover(parent);
+    try std.testing.expect(!parent.has(ck));
+}
+
+test "derived child is freed on parent deinit without explicit child teardown" {
+    // Only the parent is deinited; the child (and its tracked provision) must
+    // be recovered and freed via the parent's accumulator.
+    const parent = try Context.init(std.testing.allocator);
+    const child = try parent.derive();
+    try child.set([]const u8, Key.of([]const u8, "c"), "owned-by-child");
+    parent.deinit(); // cascades: child recover + free, then store free
 }
