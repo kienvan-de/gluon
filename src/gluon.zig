@@ -15,9 +15,19 @@ pub const Iterator = effect_iter.Iterator;
 pub const Guard = effect_iter.Guard;
 pub const execute = effect_iter.execute;
 
+pub const type_id = @import("context/type_id.zig");
+pub const TypeId = type_id.TypeId;
+pub const typeId = type_id.typeId;
+
+pub const store = @import("coeffect/store.zig");
+pub const Store = store.Store;
+pub const Key = store.Key;
+
 test {
     // Pull in referenced modules' tests.
     _ = accumulator;
     _ = effect_fn;
     _ = effect_iter;
+    _ = type_id;
+    _ = store;
 }
