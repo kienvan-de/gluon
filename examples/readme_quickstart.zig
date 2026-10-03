@@ -59,6 +59,28 @@ test "README quickstart: loader reconcile" {
     try std.testing.expect(loader.isActive("db"));
 }
 
+// Schema-validated config: a config value is validated up-front, passed to the
+// component, and a VALUE change triggers a reload (§5.2.1 material change).
+const DbCfg = struct { port: u16 };
+const db_schema = gluon.Schema(DbCfg){ .constraints = &.{
+    .{ .int_range = .{ .field = "port", .min = 1, .max = 65535 } },
+} };
+
+test "README quickstart: schema-validated config" {
+    // Invalid config is rejected before any load.
+    try std.testing.expectError(
+        gluon.ValidationError.OutOfRange,
+        gluon.Config.of(std.testing.allocator, DbCfg, db_schema, .{ .port = 0 }),
+    );
+
+    // A valid config is built, validated, and reconciled (loader owns it).
+    const cfg = try gluon.Config.of(std.testing.allocator, DbCfg, db_schema, .{ .port = 5432 });
+    var loader = try gluon.Loader.init(std.testing.allocator);
+    defer loader.deinit();
+    try loader.reconcile(&.{.{ .name = "db", .component = db_component, .config = cfg }});
+    try std.testing.expect(loader.isActive("db"));
+}
+
 // Events: listeners are revertible effects over a tagged registry (§3.4.2).
 // `ctx.on` returns a disposer tracked on the context, so unloading the
 // subscriber withdraws its listener automatically (Definition 8).

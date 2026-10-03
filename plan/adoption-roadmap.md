@@ -162,12 +162,22 @@ purely additive.
 
 ### Tier 2 — Ready · adds comptime machinery or API surface
 
-**4. Schema-validated config** — ★★★★☆
+**4. Schema-validated config** — ✅✅ **ADOPTED (2026-10)**
 - Replace opaque `?*anyopaque` config with a comptime-typed config per component
   + validation; diff *config values* (not just code identity) in `reconcile`.
   Zig `comptime` is ideal (compile-time schema from a struct type).
 - *Value:* High. Turns HMR/reconcile from code-identity to true material-change
   detection.
+- **Shipped:** `src/loader/schema.zig` — `Schema(T)` (comptime constraints:
+  `int_range`, `non_empty`, `predicate`), `Config` (type-erased validated
+  carrier with value-`eql` for the material diff + owned heap copy),
+  `ValidationError`. `ConfigEntry.config: ?Config` (optional — existing
+  config-less entries unchanged); `Fiber.config` + `Orchestrator.loadWithConfig`
+  thread it to `apply`. `reconcile` now treats a config VALUE change as a
+  material revision → HMR reload (previously only code-identity changes
+  reloaded; a config-only change was a silent no-op). The loader owns each
+  realized config and frees it on teardown/replace/deinit. 15 new tests (schema
+  unit + config-driven reconcile + OOM), 114 total passing Debug + ReleaseSafe.
 
 **5. Comptime-typed service accessors** — ★★★☆☆
 - Generate typed accessors from a comptime key registry so call sites read

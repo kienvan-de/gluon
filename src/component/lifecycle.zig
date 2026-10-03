@@ -143,7 +143,7 @@ pub const Orchestrator = struct {
         // Build and run the effect iterator against the fiber's own context.
         // The guard holds the transition only while target is unchanged
         // (Alg 5 line 15 guard: fiber.target == target0) — realizing L-Divert.
-        const iter = fiber.component.apply(fiber.ctx, null) catch |err| {
+        const iter = fiber.component.apply(fiber.ctx, fiber.config) catch |err| {
             // Infrastructure OOM is propagated, not swallowed as a component
             // failure; a genuine component refusal routes to FAILED (§4.4).
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -317,6 +317,13 @@ pub const Orchestrator = struct {
     /// to the registry, and drive its initial refresh (which activates it if
     /// its dependencies are already satisfied).
     pub fn load(self: *Self, component: Component, parent: ?FiberId) !FiberId {
+        return self.loadWithConfig(component, parent, null);
+    }
+
+    /// As `load`, but instantiates the fiber with a type-erased `config` passed
+    /// to `component.apply` (§4.4 Configuration). The config is owned by the
+    /// caller and must outlive the fiber.
+    pub fn loadWithConfig(self: *Self, component: Component, parent: ?FiberId, config: ?*anyopaque) !FiberId {
         // Theorem 47 precondition (the half O-Insert does not already cover):
         // a component's provided keys must be commutative, so its effects are
         // independent of every other component's. Provision disjointness is
@@ -332,6 +339,7 @@ pub const Orchestrator = struct {
         const child_ctx = try self.root_ctx.derive();
         const fiber = try self.allocator.create(Fiber);
         fiber.* = Fiber.init(id, component, parent, child_ctx);
+        fiber.config = config;
         // insert takes ownership of `fiber` on success; on failure we still own
         // it. (The derived child_ctx is owned by root_ctx's accumulator via
         // derive, so it is reclaimed by root_ctx.deinit on every path.)

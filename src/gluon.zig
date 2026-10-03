@@ -49,6 +49,12 @@ pub const loader = @import("loader/loader.zig");
 pub const Loader = loader.Loader;
 pub const ConfigEntry = loader.ConfigEntry;
 
+pub const schema = @import("loader/schema.zig");
+pub const Schema = schema.Schema;
+pub const Constraint = schema.Constraint;
+pub const Config = schema.Config;
+pub const ValidationError = schema.ValidationError;
+
 pub const key_registry = @import("coeffect/key_registry.zig");
 pub const Coeffect = key_registry.Coeffect;
 pub const CommutativityWitness = key_registry.CommutativityWitness;
@@ -82,5 +88,6 @@ test {
     _ = lifecycle;
     _ = interception;
     _ = loader;
+    _ = schema;
     _ = key_registry;
 }

@@ -25,17 +25,23 @@
 const std = @import("std");
 const lifecycle = @import("../component/lifecycle.zig");
 const comp = @import("../component/component.zig");
+const schema_mod = @import("schema.zig");
 
 pub const Orchestrator = lifecycle.Orchestrator;
 pub const Component = comp.Component;
 pub const FiberId = comp.FiberId;
+pub const Config = schema_mod.Config;
 
 /// A declarative request to run `component`, identified by a stable `name`.
 /// `enabled` toggles the entry without removing it from the configuration.
+/// `config` is an optional validated, type-erased config (built via
+/// schema.Config.of) passed to the component's apply (§4.4 Configuration); a
+/// change in its value is a material revision that triggers a reload (§5.2.1).
 pub const ConfigEntry = struct {
     name: []const u8,
     component: Component,
     enabled: bool = true,
+    config: ?Config = null,
 };
 
 /// Tracks the running realization of each configured entry.
@@ -43,6 +49,10 @@ const Realized = struct {
     component: Component,
     enabled: bool,
     fiber: ?FiberId, // null when disabled or not yet loaded
+    /// The loader-owned config currently realized for this entry (copied from
+    /// the ConfigEntry on load; freed on teardown/replace). Must outlive the
+    /// fiber, which holds a borrowed pointer into it.
+    config: ?Config,
 };
 
 /// The declarative loader. Owns an orchestrator and the current realized set.
@@ -63,6 +73,9 @@ pub const Loader = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Free any configs the loader still owns before dropping the map.
+        var it = self.entries.valueIterator();
+        while (it.next()) |r| if (r.config) |c| c.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         self.orch.deinit();
     }
@@ -77,6 +90,29 @@ pub const Loader = struct {
         for (a.inject, b.inject) |x, y| if (!std.mem.eql(u8, x.name, y.name)) return false;
         for (a.provide, b.provide) |x, y| if (!std.mem.eql(u8, x.name, y.name)) return false;
         return true;
+    }
+
+    /// Whether the config VALUE changed between the running realization and a
+    /// desired entry — the material-change diff of §5.2.1 that code-identity
+    /// alone misses. both-absent = unchanged; presence toggled = changed;
+    /// both-present = compared by Config.eql.
+    fn configChanged(cur: ?Config, desired: ?Config) bool {
+        if (cur == null and desired == null) return false;
+        if (cur == null or desired == null) return true;
+        return !cur.?.eql(desired.?);
+    }
+
+    /// Load a fiber for an entry, passing its config pointer (if any) to apply.
+    fn loadEntry(self: *Self, entry: ConfigEntry) !FiberId {
+        const cfg_ptr: ?*anyopaque = if (entry.config) |c| c.ptr else null;
+        return self.orch.loadWithConfig(entry.component, comp.root, cfg_ptr);
+    }
+
+    /// Adopt an entry's config into a Realized record, freeing any config the
+    /// record previously owned. Takes ownership of `desired`'s config.
+    fn adoptConfig(self: *Self, cur: *Realized, desired: ConfigEntry) void {
+        if (cur.config) |old| old.deinit(self.allocator);
+        cur.config = desired.config;
     }
 
     /// §5.2.1 reconcile: bring the running system to match `desired`. Computes
@@ -96,12 +132,21 @@ pub const Loader = struct {
             if (existing) |cur| {
                 try self.reconcileExisting(entry, cur);
             } else {
-                // New entry.
-                var realized = Realized{ .component = entry.component, .enabled = entry.enabled, .fiber = null };
+                // New entry. Reserve the map slot before loading so a load
+                // failure cannot strand an owned config.
+                var realized = Realized{ .component = entry.component, .enabled = entry.enabled, .fiber = null, .config = entry.config };
                 if (entry.enabled) {
-                    realized.fiber = try self.orch.load(entry.component, comp.root);
+                    realized.fiber = self.loadEntry(entry) catch |err| {
+                        if (entry.config) |c| c.deinit(self.allocator);
+                        return err;
+                    };
                 }
-                try self.entries.put(self.allocator, entry.name, realized);
+                self.entries.put(self.allocator, entry.name, realized) catch |err| {
+                    if (realized.fiber) |fid| self.orch.unloadFiber(fid) catch {};
+                    if (realized.fiber) |fid| self.orch.removeFiber(fid) catch {};
+                    if (entry.config) |c| c.deinit(self.allocator);
+                    return err;
+                };
             }
         }
 
@@ -110,28 +155,39 @@ pub const Loader = struct {
     }
 
     fn reconcileExisting(self: *Self, entry: ConfigEntry, cur: *Realized) !void {
-        const code_changed = !sameCode(cur.component, entry.component);
+        // Material change (§5.2.1) = code changed OR config VALUE changed.
+        const material = !sameCode(cur.component, entry.component) or configChanged(cur.config, entry.config);
 
-        if (code_changed) {
-            // §5.2.2 HMR: retire+remove the old fiber, load a fresh one.
+        if (material) {
+            // §5.2.2 HMR / §4.4 Configuration revision: retire+remove the old
+            // fiber, adopt the new code+config, load a fresh one.
             try self.teardownEntry(cur);
             cur.component = entry.component;
             cur.enabled = entry.enabled;
+            self.adoptConfig(cur, entry); // frees old config, takes new
             if (entry.enabled) {
-                cur.fiber = try self.orch.load(entry.component, comp.root);
+                cur.fiber = try self.loadEntry(entry);
             }
             return;
         }
 
-        // Same code: handle enable/disable transitions.
+        // No material change: handle enable/disable transitions. The config is
+        // unchanged, so free the duplicate the desired entry carries (we keep
+        // ours) to avoid leaking it.
+        if (entry.config) |c| c.deinit(self.allocator);
+
         if (cur.enabled and !entry.enabled) {
-            // Disable: retire + remove, keep the entry tracked.
+            // Disable: retire + remove, keep the entry (and its config) tracked.
             try self.teardownEntry(cur);
             cur.enabled = false;
         } else if (!cur.enabled and entry.enabled) {
             // Re-enable: instantiate a FRESH fiber (§4.4 Configuration).
             cur.enabled = true;
-            cur.fiber = try self.orch.load(entry.component, comp.root);
+            cur.fiber = try self.orch.loadWithConfig(
+                cur.component,
+                comp.root,
+                if (cur.config) |cc| cc.ptr else null,
+            );
         }
         // else: unchanged → no-op.
     }
@@ -155,6 +211,7 @@ pub const Loader = struct {
         for (to_remove.items) |name| {
             const cur = self.entries.getPtr(name).?;
             try self.teardownEntry(cur);
+            if (cur.config) |c| c.deinit(self.allocator);
             _ = self.entries.remove(name);
         }
     }
@@ -287,6 +344,117 @@ test "Theorem 80: reconcile endpoint equals a from-scratch load" {
     try std.testing.expect(incremental.isActive("a") and incremental.isActive("b"));
     try std.testing.expect(!incremental.orch.isProvided(Key.of(u32, "x")));
     try std.testing.expect(!scratch.orch.isProvided(Key.of(u32, "x")));
+}
+
+// ── Config-driven reconciliation (§5.2.1 material change via config) ──
+
+const PortCfg = struct { port: u16 };
+const port_schema = schema_mod.Schema(PortCfg){ .constraints = &.{
+    .{ .int_range = .{ .field = "port", .min = 1, .max = 65535 } },
+} };
+
+// A provider whose provisioned value is read from its config (port), so the
+// effect observably depends on the config value.
+fn portProvider() Component {
+    const S = struct {
+        const k = [_]Key{Key.of(u16, "server.port")};
+        fn apply(ctx: *@import("../context/context.zig").Context, config: ?*anyopaque) anyerror!@import("../context/context.zig").Context.Iterator {
+            const Ctx = @import("../context/context.zig").Context;
+            const Iter = struct {
+                port: u16,
+                fn make(a: std.mem.Allocator, port: u16) !Ctx.Iterator {
+                    const self = try a.create(@This());
+                    self.* = .{ .port = port };
+                    return .{ .state = self, .next_fn = next, .deinit_fn = deinit };
+                }
+                fn next(state: *anyopaque, a: std.mem.Allocator, c: *Ctx) anyerror!fixtures.Step(Ctx) {
+                    const self: *@This() = @ptrCast(@alignCast(state));
+                    try c.store.set(u16, Key.of(u16, "server.port"), self.port);
+                    const kb = try a.create(Key);
+                    kb.* = Key.of(u16, "server.port");
+                    const Inv = struct {
+                        fn call(s: *anyopaque, cc: *Ctx) void {
+                            cc.store.restrict(@as(*Key, @ptrCast(@alignCast(s))).*) catch {};
+                        }
+                        fn dfn(s: *anyopaque, aa: std.mem.Allocator) void {
+                            aa.destroy(@as(*Key, @ptrCast(@alignCast(s))));
+                        }
+                    };
+                    return .{ .inverse = .{ .state = kb, .call = Inv.call, .deinit = Inv.dfn }, .done = true };
+                }
+                fn deinit(state: *anyopaque, a: std.mem.Allocator) void {
+                    a.destroy(@as(*@This(), @ptrCast(@alignCast(state))));
+                }
+            };
+            const cfg: *const PortCfg = @ptrCast(@alignCast(config.?));
+            return Iter.make(ctx.allocator, cfg.port);
+        }
+    };
+    return .{ .inject = &.{}, .provide = &S.k, .apply = S.apply };
+}
+
+test "§5.2.1 config: a validated config is passed to apply" {
+    var loader = try Loader.init(std.testing.allocator);
+    defer loader.deinit();
+
+    const cfg = try Config.of(std.testing.allocator, PortCfg, port_schema, .{ .port = 8080 });
+    try loader.reconcile(&.{.{ .name = "srv", .component = portProvider(), .config = cfg }});
+
+    try std.testing.expectEqual(@as(u16, 8080), try loader.orch.root_ctx.get(u16, Key.of(u16, "server.port")));
+}
+
+test "§5.2.1 material change: a config VALUE change reloads the fiber" {
+    var loader = try Loader.init(std.testing.allocator);
+    defer loader.deinit();
+    const kport = Key.of(u16, "server.port");
+
+    const c1 = try Config.of(std.testing.allocator, PortCfg, port_schema, .{ .port = 8080 });
+    try loader.reconcile(&.{.{ .name = "srv", .component = portProvider(), .config = c1 }});
+    const fid1 = loader.entries.get("srv").?.fiber.?;
+    try std.testing.expectEqual(@as(u16, 8080), try loader.orch.root_ctx.get(u16, kport));
+
+    // Same code (same apply), DIFFERENT config value → material change → reload.
+    const c2 = try Config.of(std.testing.allocator, PortCfg, port_schema, .{ .port = 9090 });
+    try loader.reconcile(&.{.{ .name = "srv", .component = portProvider(), .config = c2 }});
+    const fid2 = loader.entries.get("srv").?.fiber.?;
+
+    try std.testing.expect(fid1 != fid2); // fiber swapped
+    try std.testing.expectEqual(@as(u16, 9090), try loader.orch.root_ctx.get(u16, kport));
+}
+
+test "§5.2.1 config: an unchanged config value is a no-op (no reload)" {
+    var loader = try Loader.init(std.testing.allocator);
+    defer loader.deinit();
+
+    const c1 = try Config.of(std.testing.allocator, PortCfg, port_schema, .{ .port = 8080 });
+    try loader.reconcile(&.{.{ .name = "srv", .component = portProvider(), .config = c1 }});
+    const fid1 = loader.entries.get("srv").?.fiber;
+
+    const c2 = try Config.of(std.testing.allocator, PortCfg, port_schema, .{ .port = 8080 }); // same value
+    try loader.reconcile(&.{.{ .name = "srv", .component = portProvider(), .config = c2 }});
+    const fid2 = loader.entries.get("srv").?.fiber;
+
+    try std.testing.expectEqual(fid1, fid2); // not reloaded
+}
+
+test "schema: an invalid config is rejected before load" {
+    try std.testing.expectError(
+        schema_mod.ValidationError.OutOfRange,
+        Config.of(std.testing.allocator, PortCfg, port_schema, .{ .port = 0 }),
+    );
+}
+
+fn configReconcileUnderOom(allocator: std.mem.Allocator) !void {
+    var loader = try Loader.init(allocator);
+    defer loader.deinit();
+    const c1 = try Config.of(allocator, PortCfg, port_schema, .{ .port = 8080 });
+    try loader.reconcile(&.{.{ .name = "srv", .component = portProvider(), .config = c1 }});
+    const c2 = try Config.of(allocator, PortCfg, port_schema, .{ .port = 9090 });
+    try loader.reconcile(&.{.{ .name = "srv", .component = portProvider(), .config = c2 }});
+}
+
+test "OOM safety: config-driven reconcile leaks nothing on any failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, configReconcileUnderOom, .{});
 }
 
 fn loaderScenario(allocator: std.mem.Allocator) !void {

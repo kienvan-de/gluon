@@ -124,6 +124,10 @@ pub const Fiber = struct {
     parent: ?FiberId,
     /// The child context this fiber's effects run in (derived from parent's).
     ctx: *Context,
+    /// The (type-erased) config this fiber was instantiated with (§4.4
+    /// Configuration), passed to `component.apply`. Null = no config. Owned by
+    /// the loader/caller, not the fiber; must outlive the fiber.
+    config: ?*anyopaque = null,
 
     /// θ — current lifecycle phase.
     phase: Phase,
@@ -148,6 +152,7 @@ pub const Fiber = struct {
             .component = component,
             .parent = parent,
             .ctx = ctx,
+            .config = null,
             .phase = .inactive,
             .retired = false,
             .committed = null,
