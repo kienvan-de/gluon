@@ -1,7 +1,9 @@
 //! Gluon — a Zig implementation of spatiotemporal composability.
 //! See plan/building-blocks.md for the paper-to-module map.
 //!
-//! Phase 1 (in progress): effect foundations.
+//! Implements the core library of the Cordis meta-framework (arXiv:2608.25512):
+//! revertible effects, reactive coeffects, the unified context paradigm, the
+//! component lifecycle calculus, and a declarative loader with HMR.
 
 pub const accumulator = @import("effect/accumulator.zig");
 pub const Accumulator = accumulator.Accumulator;

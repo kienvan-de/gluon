@@ -46,78 +46,105 @@ Components declare their requirements (coeffects) as structured data. If a depen
 
 Here is a conceptual example of how to declare and run a spatiotemporally composable component using Gluon in Zig.
 
-### 1. Defining a Composable Component
+### 1. Defining a Component
+
+A component is a `(inject, provide, apply)` triple. `apply` returns an **effect
+iterator**: each step performs a side effect and yields its **inverse**, which
+Gluon tracks and runs in LIFO order on unload.
 
 ```zig
 const std = @import("std");
 const gluon = @import("gluon");
 
-// 1. Declare the Coeffects (Dependencies/Environment Configuration)
-pub const ServerConfig = struct {
-    port: u16,
-    db_url: []const u8,
-};
+const Context = gluon.Context;
+const Key = gluon.Key;
 
-pub const MyService = struct {
-    // Tell Gluon what dependencies this component expects
-    pub const coeffects = .{
-        .config = ServerConfig,
+// A coeffect key: a logical name + the type of its value.
+const db_key = Key.of(u32, "db.port");
+
+// A database component: it PROVIDES `db.port` on activation and withdraws it
+// (automatically, via the tracked inverse) on deactivation.
+fn dbApply(ctx: *Context, _: ?*anyopaque) anyerror!Context.Iterator {
+    const Iter = struct {
+        fn make(a: std.mem.Allocator) !Context.Iterator {
+            const self = try a.create(@This());
+            self.* = .{};
+            return .{ .state = self, .next_fn = next, .deinit_fn = deinit };
+        }
+        fn next(_: *anyopaque, a: std.mem.Allocator, c: *Context) anyerror!gluon.effect_iter.Step(Context) {
+            try c.store.set(u32, db_key, 5432); // forward effect: provision
+            const kb = try a.create(Key);
+            kb.* = db_key;
+            const Inv = struct { // the inverse Gluon holds and runs on unload
+                fn call(s: *anyopaque, cc: *Context) void {
+                    cc.store.restrict(@as(*Key, @ptrCast(@alignCast(s))).*) catch {};
+                }
+                fn dfn(s: *anyopaque, aa: std.mem.Allocator) void {
+                    aa.destroy(@as(*Key, @ptrCast(@alignCast(s))));
+                }
+            };
+            return .{ .inverse = .{ .state = kb, .call = Inv.call, .deinit = Inv.dfn }, .done = true };
+        }
+        fn deinit(s: *anyopaque, a: std.mem.Allocator) void {
+            a.destroy(@as(*@This(), @ptrCast(@alignCast(s))));
+        }
     };
+    return Iter.make(ctx.allocator);
+}
 
-    // The runtime handles initialization when coeffects are satisfied
-    pub fn init(ctx: *gluon.Context) !MyService {
-        const cfg = ctx.getCoeffect(.config);
-        
-        // Let's spawn a hypothetical background web server
-        const server = try WebServer.start(cfg.port, cfg.db_url);
-        
-        // Register a Revertible Effect. 
-        // If this component is ever unloaded, Gluon guarantees this action is run.
-        try ctx.effect(server, struct {
-            fn revert(s: WebServer) void {
-                s.stop();
-            }
-        }.revert);
-
-        std.log.info("MyService started successfully on port {d}", .{cfg.port});
-        return MyService{};
-    }
+const db_component = gluon.Component{
+    .inject = &.{}, // depends on nothing
+    .provide = &.{db_key}, // provides db.port
+    .apply = dbApply,
 };
 ```
 
-### 2. Loading and Managing Components
+### 2. Orchestrating Components
+
+The `Orchestrator` loads, retires, and removes components, driving the reactive
+lifecycle: a consumer activates only once its dependencies are provided, and a
+provider's withdrawal is deferred until its dependents have deactivated
+(Theorem 70 ordering).
 
 ```zig
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
 
-    // Create the Gluon Runtime
-    var runtime = try gluon.Runtime.init(allocator);
-    defer runtime.deinit();
+    var orch = try gluon.Orchestrator.init(gpa.allocator());
+    defer orch.deinit();
 
-    // 1. Set the environment context (Coeffects)
-    try runtime.setCoeffect(.config, ServerConfig{
-        .port = 8080,
-        .db_url = "postgresql://localhost:5432/db",
-    });
+    // Load the provider. With no unmet dependencies, it activates immediately
+    // and provisions db.port into the shared context.
+    const db_id = try orch.load(db_component, gluon.component.root);
+    std.debug.assert(orch.isProvided(db_key));
 
-    // 2. Load the component. Since its coeffects are satisfied, it immediately activates.
-    const component_id = try runtime.loadComponent(MyService);
-
-    // 3. Reconcile Configuration (Spatial Reactivity)
-    // Changing the port will trigger an automatic teardown of the old instance,
-    // propagation of the new coeffects, and reactivation with the new configuration.
-    try runtime.setCoeffect(.config, ServerConfig{
-        .port = 9090,
-        .db_url = "postgresql://localhost:5432/db",
-    });
-
-    // 4. Unload (Temporal Reversion)
-    // Under the hood, this triggers the registered `revert` function, stopping the web server cleanly.
-    try runtime.unloadComponent(component_id);
+    // Unload (Temporal Reversion): the tracked inverse withdraws db.port.
+    // Any dependents are deactivated first, then this fiber's effects revert.
+    try orch.unloadFiber(db_id);
+    std.debug.assert(!orch.isProvided(db_key));
 }
+```
+
+### 3. Declarative Loading & Hot Module Replacement
+
+The `Loader` reconciles a declarative configuration against the running system,
+emitting the minimal set of load/unload/reload steps. Swapping a component's
+code hot-replaces its fiber while preserving the logical entry identity.
+
+```zig
+var loader = try gluon.Loader.init(allocator);
+defer loader.deinit();
+
+// Bring the system up to match a desired configuration.
+try loader.reconcile(&.{
+    .{ .name = "db", .component = db_component },
+});
+
+// Re-reconciling with the same config is a no-op (reload only on real change).
+// Changing a component's code triggers an HMR swap of its fiber.
+// Removing an entry retires and removes it. The quiescent state always equals
+// a from-scratch load of the final config (Theorem 80, confluence).
 ```
 
 ---

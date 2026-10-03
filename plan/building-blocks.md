@@ -6,6 +6,34 @@ This document maps every formal construct in the paper to a concrete Zig buildin
 
 ---
 
+## ✅ Implementation Status — ALL PHASES COMPLETE
+
+| Phase | Scope | Module(s) | Tests |
+|-------|-------|-----------|-------|
+| 1–2 | Effect foundations: accumulator φ, 𝔈Γ, iterator ℑΓ, execute | `effect/accumulator.zig`, `effect/effect_fn.zig`, `effect/effect_iter.zig` | ✅ |
+| 3 | Coeffects: TypeId, store Σiso, Context Γ∞, spec/satisfaction/classify | `context/type_id.zig`, `coeffect/store.zig`, `context/context.zig`, `coeffect/spec.zig` | ✅ |
+| 4 | Component, Fiber, lifecycle (Alg 5), notify (Alg 3), orchestration | `component/component.zig`, `component/registry.zig`, `component/lifecycle.zig` | ✅ |
+| 5 | Orchestration + metatheory (guard, ordering, confluence) | folded into Phase 4 | ✅ |
+| 6 | Interception (isolation already in store) | `coeffect/interception.zig` | ✅ |
+| 6.5 | Failure handling (FAILED state) | folded into `lifecycle.zig` (`markFailed`) | ✅ |
+| 7 | Loader: reconciliation + HMR | `loader/loader.zig` | ✅ |
+| 8 | Commutativity witnesses + comptime key gate | `coeffect/key_registry.zig` | ✅ |
+
+**70 tests, all passing in Debug and ReleaseSafe.** Every error path is
+OOM-safe (verified via `std.testing.checkAllAllocationFailures`, which found
+and fixed ~9 real/latent leaks during phase reviews).
+
+**Property/theorem coverage (executable):** Thm 7 (soundness invariant),
+Thm 16 (LIFO revert), Thm 10/11 (monoid), Def 22 (reactive classification),
+Def 53 (provided-by), Def 54 / Thm 70 (ordering guard), Cor 69 (terminal
+recovery), Def 52 (instantiation cascade, transitive), Thm 80 (confluence /
+reconcile-endpoint = from-scratch load), Def 44/46/47 (commutativity witness,
+comptime-gated), §4.4 Failure (FAILED route), §5.2.2 HMR (fiber swap).
+
+Run: `zig build test` (add `-Doptimize=ReleaseSafe` for the safe-optimized run).
+
+---
+
 ## 🏗️ Building Block Hierarchy
 
 ### **Layer 0: Foundation Primitives** (Paper: §3.1, §3.2, §3.3.1)
