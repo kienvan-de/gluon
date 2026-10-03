@@ -23,6 +23,9 @@ pub const store = @import("coeffect/store.zig");
 pub const Store = store.Store;
 pub const Key = store.Key;
 
+pub const context = @import("context/context.zig");
+pub const Context = context.Context;
+
 test {
     // Pull in referenced modules' tests.
     _ = accumulator;
@@ -30,4 +33,5 @@ test {
     _ = effect_iter;
     _ = type_id;
     _ = store;
+    _ = context;
 }

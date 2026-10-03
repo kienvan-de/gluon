@@ -105,7 +105,7 @@ pub const Store = struct {
             }
         };
         try self.values.put(self.allocator, realm, .{
-            .ptr = box,
+            .ptr = @ptrCast(box),
             .value_type = key.value_type,
             .deinit = Boxed.deinit,
         });
