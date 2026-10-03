@@ -30,6 +30,9 @@ pub const spec = @import("coeffect/spec.zig");
 pub const Spec = spec.Spec;
 pub const Classification = spec.Classification;
 
+pub const interception = @import("coeffect/interception.zig");
+pub const InterceptTable = interception.InterceptTable;
+
 pub const component = @import("component/component.zig");
 pub const Component = component.Component;
 pub const Fiber = component.Fiber;
@@ -56,4 +59,5 @@ test {
     _ = registry;
     _ = lifecycle;
     _ = @import("component/lifecycle_test.zig");
+    _ = interception;
 }
