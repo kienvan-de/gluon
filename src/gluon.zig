@@ -40,6 +40,9 @@ pub const View = component.View;
 pub const registry = @import("component/registry.zig");
 pub const Registry = registry.Registry;
 
+pub const lifecycle = @import("component/lifecycle.zig");
+pub const Orchestrator = lifecycle.Orchestrator;
+
 test {
     // Pull in referenced modules' tests.
     _ = accumulator;
@@ -51,4 +54,6 @@ test {
     _ = spec;
     _ = component;
     _ = registry;
+    _ = lifecycle;
+    _ = @import("component/lifecycle_test.zig");
 }
