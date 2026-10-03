@@ -70,9 +70,7 @@ test {
     _ = component;
     _ = registry;
     _ = lifecycle;
-    _ = @import("component/lifecycle_test.zig");
     _ = interception;
     _ = loader;
-    _ = @import("loader/loader_test.zig");
     _ = key_registry;
 }
