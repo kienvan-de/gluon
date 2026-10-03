@@ -37,6 +37,9 @@ pub const FiberId = component.FiberId;
 pub const Phase = component.Phase;
 pub const View = component.View;
 
+pub const registry = @import("component/registry.zig");
+pub const Registry = registry.Registry;
+
 test {
     // Pull in referenced modules' tests.
     _ = accumulator;
@@ -47,4 +50,5 @@ test {
     _ = context;
     _ = spec;
     _ = component;
+    _ = registry;
 }
