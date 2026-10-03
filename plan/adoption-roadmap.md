@@ -115,10 +115,14 @@ purely additive.
 
 ### Tier 1 — Ready now · pure library code · zero new deps
 
-**1. `{ required, optional }` dependency distinction** — ★★★★★
+**1. `{ required, optional }` dependency distinction** — ★★★★★ Zig-readiness, ⚠️ **fidelity-gated**
 - Split `inject` into required (gates activation) vs optional (reactive but
   non-gating). A struct-field change + a tweak to `computeTarget`/satisfaction.
-- *Value:* High. The most-used Cordis ergonomic we lack; the paper models it.
+- *Value:* High. The most-used Cordis ergonomic we lack.
+- ⚠️ **Paper-fidelity concern — do NOT adopt first.** "the paper models it" is
+  **unverified**; the paper's model treats injection as a *hard gating*
+  precondition (Def 52 cascade, Thm 70 ordering). Non-gating deps need their own
+  soundness story. See §5 "Held back on fidelity grounds."
 
 **2. Transparent interception merge inside `get`** — ★★★★★
 - Automate Def 27's `σ(k)(μ ⊕ 𝜄(k))`: a `getIntercepted(key, declared_meta)`
@@ -126,13 +130,15 @@ purely additive.
   merge to the component. We already have `InterceptTable` + `interceptOf`.
 - *Value:* Medium. Completes Def 26/27 faithfully.
 
-**3. Events-as-revertible-effects (`on`/`emit`)** — ★★★★☆
+**3. Events-as-revertible-effects (`on`/`emit`)** — ★★★★☆ ✅ **recommended first (fidelity-clean)**
 - An event bus: `ctx.on(event, handler)` returns a disposer (tracked effect);
   `ctx.emit` dispatches. This is exactly the tagged-registry commutativity case
   (§3.4.2) whose witness we already built. Mild friction: type-erasing handler
   signatures (the `*anyopaque` pattern we use everywhere).
 - *Value:* Very high. Biggest application-level gap; unlocks real plugin
   ergonomics.
+- **Paper-grounded:** §3.4.2 (tagged registry) + Def 8 (revertible effect) +
+  Def 46/Thm 47 (commutativity witness, already built). See §5.
 
 ### Tier 2 — Ready · adds comptime machinery or API surface
 
@@ -183,13 +189,55 @@ interposition. Tracked separately in building-blocks.md.
 
 ## 5. Recommended sequencing (when work resumes)
 
-1. **Tier 1 first** — #1 (optional deps) and #3 (events): highest
-   value-to-effort, pure Zig, zero churn risk.
-2. **#4 schema config** — natural follow-on to events.
-3. **#6 async `std.Io`** — the headline feature; defer until comfortable
-   tracking `std.Io` churn (or pin a Zig version). This is what would make
-   Gluon a *peer* of Cordis in capability rather than a sound synchronous
-   subset.
+> **Fidelity gate (added after review).** A feature only qualifies if it is
+> faithful to the paper's calculus — *even if Cordis has it*. Each candidate was
+> re-screened against the paper, not just against Cordis. One Tier-1 item failed
+> this gate (see below), which changed the ordering.
+
+**Adopt first: #3 Events-as-revertible-effects (optionally bundled with #2).**
+It is the strongest fit because it is grounded in the *paper*, not merely in
+Cordis:
+- §3.4.2's **tagged-registry commutativity example** *is* the event-listener
+  case (a key whose value is a table of entries; concurrent registrations
+  commute).
+- An event listener is a **revertible effect** (Def 8): `on()` returns a
+  disposer = the inverse — our core abstraction, already implemented
+  (`ctx.effect`).
+- We **already built** the commutativity witness (Def 46 / Thm 47) for exactly
+  this shape; it is currently under-exercised.
+
+So `on`/`emit` is not importing a Cordis idea — it *surfaces a construction the
+paper explicitly describes* and composes three implemented-but-latent pieces
+(revertible effects + tagged-registry key + commutativity witness). Zero
+fidelity risk, highest value.
+
+**Sequencing:**
+1. **#3 Events** (+ optionally **#2 interception merge** — both are small and
+   both merely *complete* paper definitions, Def 8/46 and Def 26/27, that we
+   only partially realized).
+2. **#4 schema config** — faithful strengthening of §5.2.1 reconciliation;
+   natural follow-on.
+3. **#6 async `std.Io`** — the *most* paper-faithful item (§4.4 inertia is "core
+   to correctness, not optional") and the headline capability, but defer until
+   comfortable tracking `std.Io` churn (or pin a Zig version).
+
+### ⚠️ Held back on fidelity grounds: #1 optional dependencies
+
+The earlier draft of this section recommended **#1 (optional deps) first**. On
+re-screening it is the one candidate with a **paper-fidelity question mark**, so
+it must *not* lead:
+- The paper's dependency model rests on injection as a **hard activation
+  precondition** — the `relied` guard, the unload cascade (Def 52), and the
+  relied-upon ordering (Thm 70) all assume *injection = gating*.
+- "Optional dependency" (observed-but-non-gating) is a **Cordis ergonomic**. The
+  claim in §4 that "the paper models it" is **unverified** — no definition number
+  backs it, and it is absent from the fidelity table in building-blocks.md.
+- Adopting it would require its own soundness story: does an optional dep's
+  departure trigger `refresh` *without* the unload cascade? How does Thm 70's
+  ordering treat a non-gating edge?
+
+Until grounded in a specific paper definition, #1 risks diverging from the
+calculus and is **deferred pending that grounding**.
 
 **Key correction to the original plan:** C2's "stable Zig has no async" is
 obsolete. 0.16's `std.Io` makes the async-inertia model a maturity tradeoff, not
