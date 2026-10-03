@@ -115,14 +115,27 @@ purely additive.
 
 ### Tier 1 — Ready now · pure library code · zero new deps
 
-**1. `{ required, optional }` dependency distinction** — ★★★★★ Zig-readiness, ⚠️ **fidelity-gated**
+**1. `{ required, optional }` dependency distinction** — ✖ **EXCLUDED — the paper defines the opposite (verified 2026-10)**
 - Split `inject` into required (gates activation) vs optional (reactive but
   non-gating). A struct-field change + a tweak to `computeTarget`/satisfaction.
-- *Value:* High. The most-used Cordis ergonomic we lack.
-- ⚠️ **Paper-fidelity concern — do NOT adopt first.** "the paper models it" is
-  **unverified**; the paper's model treats injection as a *hard gating*
-  precondition (Def 52 cascade, Thm 70 ordering). Non-gating deps need their own
-  soundness story. See §5 "Held back on fidelity grounds."
+- *Value (as a Cordis ergonomic):* High. But it is **incompatible with the
+  paper's calculus**, confirmed by reading the paper text (not memory):
+  - **Def 21** (§3.2.2): `𝔇Σ ≔ Set(K)` — a flat set of keys, with **no**
+    required/optional annotation.
+  - **Def 22 / Eq. 22:** `σ ⊧ d ≔ ∀k ∈ d. k ∈ dom(σ)` — satisfaction is
+    universally quantified: **every** declared key must be present. Binary
+    classification (activating/deactivating/neutral) only.
+  - §3.2.2 **explicitly rejects** the optional behavior: "a component should
+    activate only once **all** the dependencies it declares are present,
+    **rather than accessing them optimistically and failing when one is
+    missing**." An optional dep is exactly that optimistic access.
+  - The word "optional" (and non-gating / soft / weak / partial-satisfaction /
+    best-effort) appears **0 times** in all 92 pages.
+- Adopting it would require a richer `𝔇Σ` than Def 21 and a weaker satisfaction
+  relation than Eq. 22, breaking the local-composability criterion the paper
+  proves and the coeffect half of Thm 70 — and would move our code (which
+  already encodes `∀k ∈ d` in `spec.zig`) **away** from the paper. Permanently
+  excluded on fidelity grounds. See §5.
 
 **2. Transparent interception merge inside `get`** — ✅✅ **ADOPTED (2026-10)**
 - Automate Def 27's `σ(k)(μ ⊕ 𝜄(k))`: a `getIntercepted(key, declared_meta)`
@@ -290,23 +303,33 @@ fidelity risk, highest value.
    to correctness, not optional") and the headline capability, but defer until
    comfortable tracking `std.Io` churn (or pin a Zig version).
 
-### ⚠️ Held back on fidelity grounds: #1 optional dependencies
+### ✖ Excluded on fidelity grounds (VERIFIED against the paper): #1 optional dependencies
 
 The earlier draft of this section recommended **#1 (optional deps) first**. On
-re-screening it is the one candidate with a **paper-fidelity question mark**, so
-it must *not* lead:
-- The paper's dependency model rests on injection as a **hard activation
-  precondition** — the `relied` guard, the unload cascade (Def 52), and the
-  relied-upon ordering (Thm 70) all assume *injection = gating*.
-- "Optional dependency" (observed-but-non-gating) is a **Cordis ergonomic**. The
-  claim in §4 that "the paper models it" is **unverified** — no definition number
-  backs it, and it is absent from the fidelity table in building-blocks.md.
-- Adopting it would require its own soundness story: does an optional dep's
-  departure trigger `refresh` *without* the unload cascade? How does Thm 70's
-  ordering treat a non-gating edge?
+re-screening it was flagged with a paper-fidelity question mark; that question
+has now been **resolved by reading the paper text** (arXiv:2608.25512, 92 pp.),
+and the verdict is **exclude, permanently**:
 
-Until grounded in a specific paper definition, #1 risks diverging from the
-calculus and is **deferred pending that grounding**.
+- **Def 21** (§3.2.2): `𝔇Σ ≔ Set(K)` — a flat set of declared keys, with **no**
+  required/optional annotation. There is no syntactic place for "optional".
+- **Def 22 / Eq. 22:** `σ ⊧ d ≔ ∀k ∈ d. k ∈ dom(σ)` — satisfaction is universally
+  quantified; **every** declared key must be present. Classification is binary.
+- §3.2.2 **explicitly designs against** the optional behavior: a component
+  "should activate only once **all** the dependencies it declares are present,
+  **rather than accessing them optimistically and failing when one is
+  missing**." An optional (non-gating) dependency *is* that optimistic access.
+- The local-composability criterion the paper proves ("a component activates
+  only at a state satisfying its specification, so it never reads a binding
+  that is absent") would be violated by a non-gating dep, taking the coeffect
+  half of Thm 70 with it.
+- Textual check: "optional" and non-gating / soft / weak / partial-satisfaction
+  / best-effort appear **0 times** in all 92 pages.
+
+Adopting #1 would require a richer `𝔇Σ` than Def 21 and a weaker satisfaction
+relation than Eq. 22 — i.e. inventing semantics the paper not only omits but
+argues against — and would move our code (already `∀k ∈ d` in `spec.zig`) *away*
+from the paper. **Permanently excluded.** The fidelity gate did its job: the one
+item it flagged was genuinely incompatible with the calculus.
 
 **Key correction to the original plan:** C2's "stable Zig has no async" is
 obsolete. 0.16's `std.Io` makes the async-inertia model a maturity tradeoff, not
