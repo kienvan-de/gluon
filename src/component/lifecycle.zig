@@ -46,6 +46,10 @@ pub const Key = store_mod.Key;
 pub const LifecycleError = error{
     OutOfMemory,
     NoSuchFiber,
+    /// A component declares a non-commutative provision (Def 46 witness) but
+    /// does not opt into ordering. Loading it would violate the Theorem 47
+    /// precondition that shared operation keys be commutative.
+    NonCommutativeProvision,
 };
 
 /// The orchestrator owns the registry and drives the lifecycle. It is the
@@ -313,6 +317,17 @@ pub const Orchestrator = struct {
     /// to the registry, and drive its initial refresh (which activates it if
     /// its dependencies are already satisfied).
     pub fn load(self: *Self, component: Component, parent: ?FiberId) !FiberId {
+        // Theorem 47 precondition (the half O-Insert does not already cover):
+        // a component's provided keys must be commutative, so its effects are
+        // independent of every other component's. Provision disjointness is
+        // enforced by registry.insert; shared-key commutativity reduces, by
+        // Theorem 45, to each provider's own witness (Def 46). A provider that
+        // installs an order-sensitive key must impose ordering rather than rely
+        // on independence (§3.4.2); we reject it here if it has not.
+        if (component.provide.len > 0 and !component.provide_witness.isCommutative()) {
+            return LifecycleError.NonCommutativeProvision;
+        }
+
         const id = self.registry.freshId();
         const child_ctx = try self.root_ctx.derive();
         const fiber = try self.allocator.create(Fiber);

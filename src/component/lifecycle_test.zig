@@ -277,3 +277,52 @@ fn orchestratorScenario(allocator: std.mem.Allocator) !void {
 test "OOM safety: full orchestrator scenario leaks nothing on any failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, orchestratorScenario, .{});
 }
+
+// ── Theorem 47: commutativity witness enforcement at load (Def 46) ──
+
+test "Def 46/Thm 47: a non-commutative provision is rejected at load" {
+    var orch = try Orchestrator.init(std.testing.allocator);
+    defer orch.deinit();
+
+    // A component that provides an order-sensitive key without opting into
+    // ordering: declared non-commutative, so load must reject it.
+    const S = struct {
+        const k = [_]Key{Key.of(u32, "middleware.chain")};
+    };
+    const bad = Component{
+        .inject = &.{},
+        .provide = &S.k,
+        .apply = ProviderApply("middleware.chain", 1),
+        .provide_witness = .{ .kind = .non_commutative, .justification = "ordered chain" },
+    };
+
+    try std.testing.expectError(error.NonCommutativeProvision, orch.load(bad, comp.root));
+    // Nothing was left behind.
+    try std.testing.expect(!orch.isProvided(Key.of(u32, "middleware.chain")));
+}
+
+test "Def 46: a commutative (tagged-registry) provision loads normally" {
+    var orch = try Orchestrator.init(std.testing.allocator);
+    defer orch.deinit();
+
+    const S = struct {
+        const k = [_]Key{Key.of(u32, "router.routes")};
+    };
+    const ok = Component{
+        .inject = &.{},
+        .provide = &S.k,
+        .apply = ProviderApply("router.routes", 1),
+        .provide_witness = .{ .kind = .tagged_registry, .justification = "unique route ids" },
+    };
+
+    const id = try orch.load(ok, comp.root);
+    try std.testing.expectEqual(comp.Phase.active, orch.registry.get(id).?.phase);
+}
+
+test "default witness is commutative: existing simple components still load" {
+    var orch = try Orchestrator.init(std.testing.allocator);
+    defer orch.deinit();
+    // providerComponent sets no witness → defaults to trivial/commutative.
+    const id = try orch.load(providerComponent("db", 1), comp.root);
+    try std.testing.expectEqual(comp.Phase.active, orch.registry.get(id).?.phase);
+}

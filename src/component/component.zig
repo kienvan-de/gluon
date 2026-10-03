@@ -25,9 +25,11 @@ const std = @import("std");
 const Context = @import("../context/context.zig").Context;
 const spec_mod = @import("../coeffect/spec.zig");
 const store_mod = @import("../coeffect/store.zig");
+const key_registry = @import("../coeffect/key_registry.zig");
 
 pub const Spec = spec_mod.Spec;
 pub const Key = store_mod.Key;
+pub const CommutativityWitness = key_registry.CommutativityWitness;
 
 /// A unique fiber name (𝔑 of Definition 49). Atoms: compared only by equality,
 /// never inspected. Drawn fresh on instantiation.
@@ -89,7 +91,7 @@ pub const Phase = enum { inactive, loading, active, unloading, failed };
 /// (§4.4 Configuration).
 pub const Apply = *const fn (ctx: *Context, config: ?*anyopaque) anyerror!Context.Iterator;
 
-/// A component ℭΓ = (d, p, e) (Definition 48).
+/// A component ℂΓ = (d, p, e) (Definition 48).
 pub const Component = struct {
     /// d — keys required from the environment.
     inject: []const Key,
@@ -98,6 +100,14 @@ pub const Component = struct {
     provide: []const Key,
     /// e — the effect-function factory run on activation.
     apply: Apply,
+    /// The commutativity witness (Def 46) the component attaches to the keys it
+    /// provides. Defaults to trivial (commutative): a component that provides
+    /// only pure values or tagged registries needs no explicit witness. A
+    /// component providing an order-sensitive key (e.g. a middleware chain)
+    /// declares `.non_commutative`, which the orchestrator rejects unless the
+    /// provider opts into ordering. The obligation falls on the PROVIDER
+    /// (Theorem 45: distinct keys are independent for free).
+    provide_witness: CommutativityWitness = CommutativityWitness.trivial(),
 
     pub fn spec(self: Component) Spec {
         return Spec.init(self.inject);
