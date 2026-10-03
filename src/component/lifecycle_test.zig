@@ -172,3 +172,36 @@ test "O-Remove after deactivation frees the fiber" {
     try orch.removeFiber(id);
     try std.testing.expectEqual(@as(?*comp.Fiber, null), orch.registry.get(id));
 }
+
+test "Definition 52: retiring a parent cascades to its instantiated children" {
+    var orch = try Orchestrator.init(std.testing.allocator);
+    defer orch.deinit();
+
+    const kc = Key.of(u32, "c");
+    const parent_id = try orch.load(providerComponent("p", 1), comp.root);
+    const child_id = try orch.load(providerComponent("c", 2), parent_id);
+    try std.testing.expectEqual(comp.Phase.active, orch.registry.get(child_id).?.phase);
+    try std.testing.expect(orch.isProvided(kc));
+
+    // Retiring the parent cascades: the child it instantiated is retired and
+    // deactivated too, and its provision is withdrawn (Def 52 cascade).
+    try orch.unloadFiber(parent_id);
+    try std.testing.expectEqual(comp.Phase.inactive, orch.registry.get(parent_id).?.phase);
+    try std.testing.expectEqual(comp.Phase.inactive, orch.registry.get(child_id).?.phase);
+    try std.testing.expect(orch.registry.get(child_id).?.retired);
+    try std.testing.expect(!orch.isProvided(kc));
+}
+
+test "Definition 52: cascade reaches grandchildren (transitive)" {
+    var orch = try Orchestrator.init(std.testing.allocator);
+    defer orch.deinit();
+
+    const gp = try orch.load(providerComponent("gp", 1), comp.root);
+    const p = try orch.load(providerComponent("p", 2), gp);
+    const c = try orch.load(providerComponent("c", 3), p);
+    try std.testing.expectEqual(comp.Phase.active, orch.registry.get(c).?.phase);
+
+    try orch.unloadFiber(gp);
+    try std.testing.expectEqual(comp.Phase.inactive, orch.registry.get(p).?.phase);
+    try std.testing.expectEqual(comp.Phase.inactive, orch.registry.get(c).?.phase);
+}

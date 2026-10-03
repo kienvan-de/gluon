@@ -190,6 +190,11 @@ pub const Orchestrator = struct {
         // schedule we first drive dependents to deactivate, then proceed.
         try self.drainDependents(fiber);
 
+        // Def 52 instantiation cascade: the children this fiber instantiated are
+        // retired by its accumulator. Retiring a child drives its own unload
+        // (and transitively its grandchildren) before we recover this fiber.
+        try self.retireChildren(fiber.id);
+
         // Apply the accumulator: recover this fiber's effects (LIFO).
         fiber.ctx.dispose.recover(fiber.ctx);
 
@@ -204,6 +209,29 @@ pub const Orchestrator = struct {
         if (fiber.target != null and fiber.target.?.active) {
             fiber.in_transition = false;
             try self.reload(fiber);
+        }
+    }
+
+    /// Def 52: retire and deactivate every fiber instantiated under `parent_id`
+    /// (its children by π). Each child's O-Retire is the inverse the parent's
+    /// instantiation effect yields; running it here realizes the cascade that
+    /// unloading a parent triggers. Children are retired so a later O-Remove
+    /// can reclaim them; they are not removed here (removal is a separate
+    /// orchestration step, §4.3.1).
+    fn retireChildren(self: *Self, parent_id: FiberId) LifecycleError!void {
+        var changed = true;
+        while (changed) {
+            changed = false;
+            var it = self.registry.fibers.valueIterator();
+            while (it.next()) |fp| {
+                const child = fp.*;
+                if (child.parent != parent_id) continue;
+                if (child.retired and !child.installed()) continue;
+                child.retired = true;
+                const before = child.phase;
+                try self.refresh(child);
+                if (child.phase != before) changed = true;
+            }
         }
     }
 
