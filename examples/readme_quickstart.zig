@@ -58,3 +58,41 @@ test "README quickstart: loader reconcile" {
     try loader.reconcile(&.{.{ .name = "db", .component = db_component }});
     try std.testing.expect(loader.isActive("db"));
 }
+
+// Events: listeners are revertible effects over a tagged registry (§3.4.2).
+// `ctx.on` returns a disposer tracked on the context, so unloading the
+// subscriber withdraws its listener automatically (Definition 8).
+const bus_key = Key.of(*gluon.EventBus, "app.bus");
+
+const Counter = struct {
+    hits: u32 = 0,
+    fn handler(self: *Counter) gluon.Handler {
+        return .{ .state = self, .call = call };
+    }
+    fn call(state: *anyopaque, payload: *const anyopaque) void {
+        const self: *Counter = @ptrCast(@alignCast(state));
+        self.hits += @as(*const u32, @ptrCast(@alignCast(payload))).*;
+    }
+};
+
+test "README quickstart: events as revertible effects" {
+    // The bus must outlive the context that subscribes to it (its disposer
+    // calls back into the bus on recover). Declare it first → deinit last.
+    var bus = gluon.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+    try ctx.set(*gluon.EventBus, bus_key, &bus);
+
+    var counter = Counter{};
+    _ = try ctx.on(u32, bus_key, "tick", counter.handler());
+
+    var one: u32 = 1;
+    _ = try ctx.emit(u32, bus_key, "tick", &one);
+    try std.testing.expectEqual(@as(u32, 1), counter.hits);
+
+    // Recovering the context withdraws the listener: later emits reach no one.
+    ctx.dispose.recover(ctx);
+    try std.testing.expectEqual(@as(usize, 0), bus.emit(u32, "tick", &one));
+}

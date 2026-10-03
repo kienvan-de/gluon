@@ -24,10 +24,14 @@ const acc = @import("../effect/accumulator.zig");
 const effect_iter = @import("../effect/effect_iter.zig");
 const store_mod = @import("../coeffect/store.zig");
 const interception = @import("../coeffect/interception.zig");
+const event_bus = @import("../event/bus.zig");
 
 pub const Key = store_mod.Key;
 pub const Store = store_mod.Store;
 pub const StoreError = store_mod.StoreError;
+pub const EventBus = event_bus.EventBus;
+pub const Handler = event_bus.Handler;
+pub const Subscription = event_bus.Subscription;
 
 /// The unified context. Owns a coeffect store and an accumulator (φ). A context
 /// may be derived from a parent (for isolation/interception child contexts);
@@ -149,6 +153,65 @@ pub const Context = struct {
     /// supplies the carried half of the merge.
     pub fn interceptOf(self: *const Self, key: Key) ?*anyopaque {
         return self.intercepts.get(key.name);
+    }
+
+    // ── Events (§3.4.2 tagged registry; Def 8 revertible effect) ─────
+    //
+    // The bus lives in the coeffect store under `bus_key` (its value type must
+    // be EventBus). A component provisions it with ctx.set; consumers reach it
+    // through ctx.on/ctx.emit. Registering a listener (ctx.on) is a REVERTIBLE
+    // effect (Definition 8): it inserts a uniquely-tagged entry and tracks the
+    // disposer (bus.off) onto THIS context's accumulator, so unloading the
+    // consumer withdraws its listeners (Theorem 7/16, LIFO). Because entries
+    // carry unique tags, concurrent registrations commute (§3.4.2) — the bus
+    // certifies a tagged_registry witness (event/bus.zig busWitness).
+
+    /// ctx.on(P, bus_key, event, handler) — register a listener for `event` on
+    /// the bus bound at `bus_key`, expecting payloads of type `P`. Tracks the
+    /// removal as an inverse on this context: recover/unload removes it.
+    /// Returns the Subscription so the caller may also unsubscribe explicitly.
+    pub fn on(
+        self: *Self,
+        comptime P: type,
+        bus_key: Key,
+        event: []const u8,
+        handler: Handler,
+    ) !Subscription {
+        const bus = try self.store.get(*EventBus, bus_key);
+        const sub = try bus.on(P, event, handler);
+        errdefer bus.off(sub);
+
+        // The inverse: remove exactly this subscription (the Def 8 disposer).
+        const State = struct { bus: *EventBus, sub: Subscription };
+        const inv_state = try self.allocator.create(State);
+        errdefer self.allocator.destroy(inv_state);
+        inv_state.* = .{ .bus = bus, .sub = sub };
+        const Impl = struct {
+            fn call(state: *anyopaque, _: *Self) void {
+                const s: *State = @ptrCast(@alignCast(state));
+                s.bus.off(s.sub);
+            }
+            fn deinit(state: *anyopaque, allocator: std.mem.Allocator) void {
+                allocator.destroy(@as(*State, @ptrCast(@alignCast(state))));
+            }
+        };
+        try self.dispose.track(.{ .state = inv_state, .call = Impl.call, .deinit = Impl.deinit });
+        return sub;
+    }
+
+    /// ctx.emit(P, bus_key, event, payload) — dispatch `payload` to every live
+    /// listener of `event` on the bus bound at `bus_key`. A read over the
+    /// registry: no provision, no inverse tracked. Returns the number of
+    /// listeners invoked.
+    pub fn emit(
+        self: *Self,
+        comptime P: type,
+        bus_key: Key,
+        event: []const u8,
+        payload: *const P,
+    ) !usize {
+        const bus = try self.store.get(*EventBus, bus_key);
+        return bus.emit(P, event, payload);
     }
 
     // ── Effect tracking (§5.1.1) ─────────────────────────────
@@ -390,6 +453,102 @@ fn deriveUnderOom(allocator: std.mem.Allocator) !void {
 
 test "OOM safety: derive + child.set leak nothing on any allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, deriveUnderOom, .{});
+}
+
+// ── Events wired into Context (§3.4.2, Def 8) ────────────────
+
+const EvSink = struct {
+    sum: u32 = 0,
+    fn handler(self: *EvSink) event_bus.Handler {
+        return .{ .state = self, .call = call };
+    }
+    fn call(state: *anyopaque, payload: *const anyopaque) void {
+        const self: *EvSink = @ptrCast(@alignCast(state));
+        self.sum += @as(*const u32, @ptrCast(@alignCast(payload))).*;
+    }
+};
+
+test "ctx.on registers a listener and ctx.emit dispatches to it" {
+    // Declare the bus FIRST so its deinit runs LAST (after ctx.deinit, which
+    // runs the listener disposer against the still-live bus). Defers are LIFO.
+    var bus = EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const bus_key = Key.of(*EventBus, "app.bus");
+    try ctx.set(*EventBus, bus_key, &bus);
+
+    var sink = EvSink{};
+    _ = try ctx.on(u32, bus_key, "tick", sink.handler());
+
+    var p: u32 = 9;
+    const n = try ctx.emit(u32, bus_key, "tick", &p);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u32, 9), sink.sum);
+}
+
+test "Definition 8: ctx.on is a revertible effect — recover withdraws the listener" {
+    var bus = EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const bus_key = Key.of(*EventBus, "app.bus");
+    try ctx.set(*EventBus, bus_key, &bus);
+
+    var sink = EvSink{};
+    _ = try ctx.on(u32, bus_key, "tick", sink.handler());
+    try std.testing.expectEqual(@as(usize, 1), bus.count("tick"));
+
+    // Recover this context: the listener's disposer runs (LIFO) and removes it.
+    // (The bus-provision inverse also runs, restricting the key.)
+    ctx.dispose.recover(ctx);
+    try std.testing.expectEqual(@as(usize, 0), bus.count("tick"));
+
+    // After recovery, emitting reaches no one (the listener is gone).
+    var p: u32 = 100;
+    try std.testing.expectEqual(@as(usize, 0), bus.emit(u32, "tick", &p));
+    try std.testing.expectEqual(@as(u32, 0), sink.sum);
+}
+
+test "§5.1.1 parent composition: unloading parent withdraws a child's listener" {
+    var bus = EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+
+    const parent = try Context.init(std.testing.allocator);
+    defer parent.deinit();
+
+    const bus_key = Key.of(*EventBus, "app.bus");
+    try parent.set(*EventBus, bus_key, &bus); // provided at parent, shared store
+
+    const child = try parent.derive();
+    var sink = EvSink{};
+    _ = try child.on(u32, bus_key, "tick", sink.handler()); // consumer in child
+    try std.testing.expectEqual(@as(usize, 1), bus.count("tick"));
+
+    // Recovering the parent cascades to the child (∂²Γ): its listener is removed.
+    parent.dispose.recover(parent);
+    try std.testing.expectEqual(@as(usize, 0), bus.count("tick"));
+}
+
+fn eventUnderOom(allocator: std.mem.Allocator) !void {
+    var bus = EventBus.init(allocator);
+    defer bus.deinit();
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+    const bus_key = Key.of(*EventBus, "app.bus");
+    try ctx.set(*EventBus, bus_key, &bus);
+    var sink = EvSink{};
+    _ = try ctx.on(u32, bus_key, "tick", sink.handler());
+    var p: u32 = 1;
+    _ = try ctx.emit(u32, bus_key, "tick", &p);
+}
+
+test "OOM safety: ctx.on + ctx.emit leak nothing on any allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, eventUnderOom, .{});
 }
 
 // ── Interception wired into Context (Def 26/27) ──────────────────

@@ -130,15 +130,24 @@ purely additive.
   merge to the component. We already have `InterceptTable` + `interceptOf`.
 - *Value:* Medium. Completes Def 26/27 faithfully.
 
-**3. Events-as-revertible-effects (`on`/`emit`)** — ★★★★☆ ✅ **recommended first (fidelity-clean)**
+**3. Events-as-revertible-effects (`on`/`emit`)** — ✅✅ **ADOPTED (2026-10)**
 - An event bus: `ctx.on(event, handler)` returns a disposer (tracked effect);
   `ctx.emit` dispatches. This is exactly the tagged-registry commutativity case
-  (§3.4.2) whose witness we already built. Mild friction: type-erasing handler
-  signatures (the `*anyopaque` pattern we use everywhere).
+  (§3.4.2) whose witness we already built.
 - *Value:* Very high. Biggest application-level gap; unlocks real plugin
   ergonomics.
 - **Paper-grounded:** §3.4.2 (tagged registry) + Def 8 (revertible effect) +
   Def 46/Thm 47 (commutativity witness, already built). See §5.
+- **Shipped in** `src/event/bus.zig` (`EventBus`, `Handler`, `Subscription`,
+  `busWitness`) + `ctx.on`/`ctx.emit` in `src/context/context.zig`. 13 new
+  tests (bus unit + context integration + OOM), 90 total passing Debug +
+  ReleaseSafe. Fidelity realized exactly as planned: each listener carries a
+  unique tag (§3.4.2), `on` tracks its `off` disposer on the accumulator so
+  recover/unload withdraws it (Def 8 / Thm 7/16), the bus certifies a
+  `tagged_registry` witness (Def 46). One real invariant surfaced and is
+  documented: **the bus must outlive its subscribers** (the disposer calls back
+  into `off` on recover); in the fiber model this holds structurally via Thm 70
+  + Def 52 ordering.
 
 ### Tier 2 — Ready · adds comptime machinery or API surface
 

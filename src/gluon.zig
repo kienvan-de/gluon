@@ -25,6 +25,12 @@ pub const store = @import("coeffect/store.zig");
 pub const Store = store.Store;
 pub const Key = store.Key;
 
+pub const event_bus = @import("event/bus.zig");
+pub const EventBus = event_bus.EventBus;
+pub const Handler = event_bus.Handler;
+pub const Subscription = event_bus.Subscription;
+pub const busWitness = event_bus.busWitness;
+
 pub const context = @import("context/context.zig");
 pub const Context = context.Context;
 
@@ -65,6 +71,7 @@ test {
     _ = effect_iter;
     _ = type_id;
     _ = store;
+    _ = event_bus;
     _ = context;
     _ = spec;
     _ = component;
