@@ -1,1 +1,3 @@
 paper.pdf
+.zig-cache/
+zig-out/
