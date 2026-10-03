@@ -98,6 +98,7 @@ pub const Store = struct {
         if (self.values.contains(realm)) return StoreError.AlreadyProvided;
 
         const box = try self.allocator.create(V);
+        errdefer self.allocator.destroy(box); // free if the map put fails
         box.* = value;
         const Boxed = struct {
             fn deinit(ptr: *anyopaque, allocator: std.mem.Allocator) void {

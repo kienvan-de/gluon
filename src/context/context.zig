@@ -49,7 +49,9 @@ pub const Context = struct {
     /// Create a root context with a freshly owned store.
     pub fn init(allocator: std.mem.Allocator) !*Self {
         const store = try allocator.create(Store);
+        errdefer allocator.destroy(store);
         store.* = Store.init(allocator);
+        errdefer store.deinit();
         const self = try allocator.create(Self);
         self.* = .{
             .allocator = allocator,
@@ -88,6 +90,7 @@ pub const Context = struct {
 
         // The inverse: restrict the key, undoing this provision.
         const inv_state = try self.allocator.create(Key);
+        errdefer self.allocator.destroy(inv_state);
         inv_state.* = key;
         const Impl = struct {
             fn call(state: *anyopaque, ctx: *Self) void {
@@ -98,6 +101,7 @@ pub const Context = struct {
                 allocator.destroy(@as(*Key, @ptrCast(@alignCast(state))));
             }
         };
+        // On track failure: errdefers unwind the store binding and inv_state.
         try self.dispose.track(.{ .state = inv_state, .call = Impl.call, .deinit = Impl.deinit });
     }
 
@@ -142,6 +146,7 @@ pub const Context = struct {
     /// accumulator holds the inverse that disposes and destroys it.
     pub fn derive(self: *Self) !*Self {
         const child = try self.allocator.create(Self);
+        errdefer self.allocator.destroy(child);
         child.* = .{
             .allocator = self.allocator,
             .store = self.store, // shared by reference
@@ -318,4 +323,31 @@ test "derived child is freed on parent deinit without explicit child teardown" {
     const child = try parent.derive();
     try child.set([]const u8, Key.of([]const u8, "c"), "owned-by-child");
     parent.deinit(); // cascades: child recover + free, then store free
+}
+
+// ── Allocation-failure safety (thorough review) ──────────────────
+//
+// checkAllAllocationFailures runs the body with the failing allocator set to
+// fail at each allocation index in turn, asserting no leak on any OOM path.
+
+fn setUnderOom(allocator: std.mem.Allocator) !void {
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+    try ctx.set(u32, Key.of(u32, "k"), 1);
+    try ctx.set([]const u8, Key.of([]const u8, "s"), "v");
+}
+
+test "OOM safety: ctx.init + ctx.set leak nothing on any allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, setUnderOom, .{});
+}
+
+fn deriveUnderOom(allocator: std.mem.Allocator) !void {
+    const parent = try Context.init(allocator);
+    defer parent.deinit();
+    const child = try parent.derive();
+    try child.set(u32, Key.of(u32, "c"), 7);
+}
+
+test "OOM safety: derive + child.set leak nothing on any allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, deriveUnderOom, .{});
 }

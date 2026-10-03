@@ -101,7 +101,11 @@ pub fn applySequence(
 ) !void {
     for (effects) |e| {
         const inv = try e.apply(allocator, ctx);
-        try accumulator.track(inv);
+        // If track fails (OOM), the inverse would otherwise leak: release it.
+        accumulator.track(inv) catch |err| {
+            inv.deinit(inv.state, allocator);
+            return err;
+        };
     }
 }
 

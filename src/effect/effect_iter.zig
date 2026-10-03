@@ -97,7 +97,11 @@ pub fn execute(
 ) !void {
     while (guard.active()) {
         const step = try iter.next(allocator, ctx);
-        try accumulator.track(step.inverse);
+        // If track fails (OOM), release the inverse so it does not leak.
+        accumulator.track(step.inverse) catch |err| {
+            step.inverse.deinit(step.inverse.state, allocator);
+            return err;
+        };
         if (step.done) break;
     }
 }
