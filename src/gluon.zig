@@ -34,6 +34,7 @@ pub const Classification = spec.Classification;
 
 pub const interception = @import("coeffect/interception.zig");
 pub const InterceptTable = interception.InterceptTable;
+pub const Merge = interception.Merge;
 
 pub const loader = @import("loader/loader.zig");
 pub const Loader = loader.Loader;

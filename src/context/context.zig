@@ -23,6 +23,7 @@ const std = @import("std");
 const acc = @import("../effect/accumulator.zig");
 const effect_iter = @import("../effect/effect_iter.zig");
 const store_mod = @import("../coeffect/store.zig");
+const interception = @import("../coeffect/interception.zig");
 
 pub const Key = store_mod.Key;
 pub const Store = store_mod.Store;
@@ -45,6 +46,10 @@ pub const Context = struct {
     dispose: Accumulator,
     /// The context this one was derived from, or null at the root.
     parent: ?*Self,
+    /// 𝜄 — the context-carried interception metadata (Definition 26). Each
+    /// context owns its own table; intercept is derived realization (§5.1.2),
+    /// so a derived child gets a fresh table and recovery just discards it.
+    intercepts: interception.InterceptTable,
 
     /// Create a root context with a freshly owned store.
     pub fn init(allocator: std.mem.Allocator) !*Self {
@@ -59,14 +64,17 @@ pub const Context = struct {
             .owns_store = true,
             .dispose = Accumulator.init(allocator),
             .parent = null,
+            .intercepts = interception.InterceptTable.init(allocator),
         };
         return self;
     }
 
     /// Tear down: recover all tracked effects (withdrawing this context's
-    /// bindings), then free the owned store if this is the root.
+    /// bindings), discard the interception table (derived realization — no
+    /// inverse to run), then free the owned store if this is the root.
     pub fn deinit(self: *Self) void {
         self.dispose.recover(self);
+        self.intercepts.deinit();
         if (self.owns_store) {
             self.store.deinit();
             self.allocator.destroy(self.store);
@@ -117,6 +125,32 @@ pub const Context = struct {
         try self.store.isolate(key, realm);
     }
 
+    // ── Interception (§5.1.2, Definitions 26/27) ──────────────────
+
+    /// ctx.intercept(key, metadata) — Definition 27. Merge `metadata` onto this
+    /// context's carried metadata 𝜄(k), right-biased (enclosing context wins).
+    /// Derived realization: adjusts 𝜄 on THIS context only, nothing to track —
+    /// recovery discards the context along with the adjustment. Takes ownership
+    /// of `metadata`.
+    pub fn intercept(
+        self: *Self,
+        key: Key,
+        metadata: *anyopaque,
+        merge: interception.Merge,
+        free: *const fn (value: *anyopaque, allocator: std.mem.Allocator) void,
+    ) !void {
+        try self.intercepts.intercept(key.name, metadata, merge, free);
+    }
+
+    /// 𝜄(k): the context-carried metadata for `key`, or null (εₖ) if none.
+    /// A component reads this and merges it with its own declared metadata
+    /// before applying the provider (Definition 27's σ(k)(μ ⊕ₖ 𝜄(k))). The
+    /// provider application itself is the component's concern; the context
+    /// supplies the carried half of the merge.
+    pub fn interceptOf(self: *const Self, key: Key) ?*anyopaque {
+        return self.intercepts.get(key.name);
+    }
+
     // ── Effect tracking (§5.1.1) ─────────────────────────────
 
     pub const Iterator = effect_iter.Iterator(Self);
@@ -153,6 +187,10 @@ pub const Context = struct {
             .owns_store = false,
             .dispose = Accumulator.init(self.allocator),
             .parent = self,
+            // Derived realization: the child gets its own 𝜄 table. (Inheriting
+            // the parent's metadata by merge is a future refinement; a fresh
+            // table is the minimal correct derived context.)
+            .intercepts = interception.InterceptTable.init(self.allocator),
         };
 
         // Prepend the child's teardown to the parent's accumulator: when the
@@ -165,9 +203,11 @@ pub const Context = struct {
             fn deinit(state: *anyopaque, allocator: std.mem.Allocator) void {
                 // Runs after `call` (or on drop): free the child shell. Its
                 // accumulator is already empty after recover; if dropped
-                // without recover, release remaining inverses first.
+                // without recover, release remaining inverses first. Discard
+                // the child's interception table (derived realization).
                 const c: *Self = @ptrCast(@alignCast(state));
                 c.dispose.deinit();
+                c.intercepts.deinit();
                 allocator.destroy(c);
             }
         };
@@ -350,4 +390,69 @@ fn deriveUnderOom(allocator: std.mem.Allocator) !void {
 
 test "OOM safety: derive + child.set leak nothing on any allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, deriveUnderOom, .{});
+}
+
+// ── Interception wired into Context (Def 26/27) ──────────────────
+
+const Flags = struct {
+    bits: u32,
+    fn create(a: std.mem.Allocator, bits: u32) !*anyopaque {
+        const self = try a.create(Flags);
+        self.* = .{ .bits = bits };
+        return self;
+    }
+    fn mergeFn(a: std.mem.Allocator, inherited: ?*anyopaque, incoming: *anyopaque) anyerror!*anyopaque {
+        const inc: *Flags = @ptrCast(@alignCast(incoming));
+        const base: u32 = if (inherited) |ih| @as(*Flags, @ptrCast(@alignCast(ih))).bits else 0;
+        const out = try a.create(Flags);
+        out.* = .{ .bits = base | inc.bits }; // union; incoming (right) wins ties
+        return out;
+    }
+    fn freeFn(value: *anyopaque, a: std.mem.Allocator) void {
+        a.destroy(@as(*Flags, @ptrCast(@alignCast(value))));
+    }
+};
+
+test "Definition 27: ctx.intercept carries metadata, interceptOf reads it" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const k = Key.of(u32, "db");
+    try std.testing.expectEqual(@as(?*anyopaque, null), ctx.interceptOf(k)); // εₖ
+
+    const m1 = try Flags.create(ctx.allocator, 0b01);
+    try ctx.intercept(k, m1, Flags.mergeFn, Flags.freeFn);
+    const m2 = try Flags.create(ctx.allocator, 0b10);
+    try ctx.intercept(k, m2, Flags.mergeFn, Flags.freeFn);
+
+    const carried: *Flags = @ptrCast(@alignCast(ctx.interceptOf(k).?));
+    try std.testing.expectEqual(@as(u32, 0b11), carried.bits); // merged union
+}
+
+test "interception is per-context: a derived child has its own 𝜄 table" {
+    const parent = try Context.init(std.testing.allocator);
+    defer parent.deinit();
+
+    const k = Key.of(u32, "k");
+    const pm = try Flags.create(parent.allocator, 0b01);
+    try parent.intercept(k, pm, Flags.mergeFn, Flags.freeFn);
+
+    const child = try parent.derive();
+    // The child starts with an empty 𝜄 (derived realization): parent's
+    // interception does not leak into the child's own table.
+    try std.testing.expectEqual(@as(?*anyopaque, null), child.interceptOf(k));
+}
+
+fn interceptUnderOom(allocator: std.mem.Allocator) !void {
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+    const k = Key.of(u32, "db");
+    const m1 = try Flags.create(ctx.allocator, 0b01);
+    try ctx.intercept(k, m1, Flags.mergeFn, Flags.freeFn);
+    const m2 = try Flags.create(ctx.allocator, 0b10);
+    try ctx.intercept(k, m2, Flags.mergeFn, Flags.freeFn);
+}
+
+test "OOM safety: ctx.intercept leaks nothing on any allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, interceptUnderOom, .{});
 }
