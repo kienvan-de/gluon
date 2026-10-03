@@ -37,6 +37,11 @@ pub const loader = @import("loader/loader.zig");
 pub const Loader = loader.Loader;
 pub const ConfigEntry = loader.ConfigEntry;
 
+pub const key_registry = @import("coeffect/key_registry.zig");
+pub const Coeffect = key_registry.Coeffect;
+pub const CommutativityWitness = key_registry.CommutativityWitness;
+pub const CommutativityKind = key_registry.CommutativityKind;
+
 pub const component = @import("component/component.zig");
 pub const Component = component.Component;
 pub const Fiber = component.Fiber;
@@ -66,4 +71,5 @@ test {
     _ = interception;
     _ = loader;
     _ = @import("loader/loader_test.zig");
+    _ = key_registry;
 }
