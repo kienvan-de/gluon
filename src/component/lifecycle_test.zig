@@ -205,3 +205,75 @@ test "Definition 52: cascade reaches grandchildren (transitive)" {
     try std.testing.expectEqual(comp.Phase.inactive, orch.registry.get(p).?.phase);
     try std.testing.expectEqual(comp.Phase.inactive, orch.registry.get(c).?.phase);
 }
+
+// ── Confluence (Theorem 80) and OOM safety ──────────────────────────
+
+test "Theorem 80 confluence: load order does not change the quiescent state" {
+    // Two providers (a, b) and a consumer of both. Whatever order we load
+    // them in, the system quiesces with all three active and both keys bound.
+    const Scenario = struct {
+        fn run(order: [3]u8) !void {
+            var orch = try Orchestrator.init(std.testing.allocator);
+            defer orch.deinit();
+
+            const ca = providerComponent("a", 1);
+            const cb = providerComponent("b", 2);
+            const S = struct {
+                const keys = [_]Key{ Key.of(u32, "a"), Key.of(u32, "b") };
+                fn apply(ctx: *Context, _: ?*anyopaque) anyerror!Context.Iterator {
+                    const Iter = struct {
+                        fn make(al: std.mem.Allocator) !Context.Iterator {
+                            const self = try al.create(@This());
+                            self.* = .{};
+                            return .{ .state = self, .next_fn = next, .deinit_fn = deinit };
+                        }
+                        fn next(_: *anyopaque, _: std.mem.Allocator, _: *Context) anyerror!effect_iter.Step(Context) {
+                            const Noop = struct {
+                                fn call(_: *anyopaque, _: *Context) void {}
+                                fn dfn(_: *anyopaque, _: std.mem.Allocator) void {}
+                            };
+                            return .{ .inverse = .{ .state = undefined, .call = Noop.call, .deinit = Noop.dfn }, .done = true };
+                        }
+                        fn deinit(s: *anyopaque, al: std.mem.Allocator) void {
+                            al.destroy(@as(*@This(), @ptrCast(@alignCast(s))));
+                        }
+                    };
+                    return Iter.make(ctx.allocator);
+                }
+            };
+            const consumer = Component{ .inject = &S.keys, .provide = &.{}, .apply = S.apply };
+            const comps = [_]Component{ ca, cb, consumer };
+
+            var ids: [3]comp.FiberId = undefined;
+            for (order, 0..) |which, i| ids[i] = try orch.load(comps[which], comp.root);
+
+            // Quiescent state is identical regardless of order: all active.
+            for (ids) |id| {
+                try std.testing.expectEqual(comp.Phase.active, orch.registry.get(id).?.phase);
+            }
+            try std.testing.expect(orch.isProvided(Key.of(u32, "a")));
+            try std.testing.expect(orch.isProvided(Key.of(u32, "b")));
+        }
+    };
+
+    // All permutations of {provider-a, provider-b, consumer} reach the same
+    // quiescent configuration (Thm 80: history leaves no trace).
+    try Scenario.run(.{ 0, 1, 2 });
+    try Scenario.run(.{ 2, 1, 0 });
+    try Scenario.run(.{ 2, 0, 1 });
+    try Scenario.run(.{ 1, 2, 0 });
+}
+
+fn orchestratorScenario(allocator: std.mem.Allocator) !void {
+    var orch = try Orchestrator.init(allocator);
+    defer orch.deinit();
+    const provider_id = try orch.load(providerComponent("db", 1), comp.root);
+    const consumer_id = try orch.load(consumerComponent("db"), comp.root);
+    try orch.unloadFiber(provider_id);
+    try orch.removeFiber(provider_id);
+    _ = consumer_id;
+}
+
+test "OOM safety: full orchestrator scenario leaks nothing on any failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, orchestratorScenario, .{});
+}

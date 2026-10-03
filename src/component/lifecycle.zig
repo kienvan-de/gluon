@@ -140,29 +140,18 @@ pub const Orchestrator = struct {
         // The guard holds the transition only while target is unchanged
         // (Alg 5 line 15 guard: fiber.target == target0) — realizing L-Divert.
         const iter = fiber.component.apply(fiber.ctx, null) catch |err| {
-            // §4.4 Failure: raise aborts to UNLOADING-equivalent; recover what
-            // was installed (nothing yet here) and mark FAILED.
-            fiber.ctx.dispose.recover(fiber.ctx);
-            if (fiber.committed) |c| {
-                c.deinit(self.allocator);
-                fiber.committed = null;
-            }
-            fiber.phase = .failed;
-            fiber.failure = err;
+            // Infrastructure OOM is propagated, not swallowed as a component
+            // failure; a genuine component refusal routes to FAILED (§4.4).
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            self.markFailed(fiber, err);
             return;
         };
         defer iter.deinit(fiber.ctx.allocator);
 
         const guard = targetGuard(fiber);
         effect_iter.execute(Context, iter, guard, fiber.ctx.allocator, fiber.ctx, &fiber.ctx.dispose) catch |err| {
-            // A raise during iteration: recover installed effects, mark FAILED.
-            fiber.ctx.dispose.recover(fiber.ctx);
-            if (fiber.committed) |c| {
-                c.deinit(self.allocator);
-                fiber.committed = null;
-            }
-            fiber.phase = .failed;
-            fiber.failure = err;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            self.markFailed(fiber, err);
             return;
         };
 
@@ -176,6 +165,19 @@ pub const Orchestrator = struct {
             fiber.in_transition = false;
             try self.unload(fiber);
         }
+    }
+
+    /// §4.4 Failure: a component raise aborts the activation. Recover whatever
+    /// was installed (Cor 69 leaves nothing), discard the committed view, and
+    /// record the error on the fiber (FAILED withholds re-entry until revised).
+    fn markFailed(self: *Self, fiber: *Fiber, err: anyerror) void {
+        fiber.ctx.dispose.recover(fiber.ctx);
+        if (fiber.committed) |c| {
+            c.deinit(self.allocator);
+            fiber.committed = null;
+        }
+        fiber.phase = .failed;
+        fiber.failure = err;
     }
 
     /// Algorithm 5 unload: drain dependents, recover effects, go INACTIVE (or
@@ -314,9 +316,22 @@ pub const Orchestrator = struct {
         const id = self.registry.freshId();
         const child_ctx = try self.root_ctx.derive();
         const fiber = try self.allocator.create(Fiber);
-        errdefer self.allocator.destroy(fiber);
         fiber.* = Fiber.init(id, component, parent, child_ctx);
-        try self.registry.insert(fiber);
+        // insert takes ownership of `fiber` on success; on failure we still own
+        // it. (The derived child_ctx is owned by root_ctx's accumulator via
+        // derive, so it is reclaimed by root_ctx.deinit on every path.)
+        self.registry.insert(fiber) catch |err| {
+            self.allocator.destroy(fiber);
+            return err;
+        };
+        // The registry now owns `fiber`; if refresh fails, remove+free it so no
+        // half-activated fiber is left behind.
+        errdefer {
+            if (self.registry.remove(id) catch null) |f| {
+                f.deinit(self.allocator);
+                self.allocator.destroy(f);
+            }
+        }
 
         try self.refresh(fiber);
         return id;
