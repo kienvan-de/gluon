@@ -45,6 +45,9 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     /// Σ — the coeffect store. Owned by the root; borrowed by derived contexts.
     store: *Store,
+    /// σ — the provider table (Def 26, ℳₖ → 𝒱ₖ). Shared with the store's
+    /// lifetime: owned by the root, borrowed by derived contexts.
+    providers: *interception.ProviderTable,
     owns_store: bool,
     /// φ — this level's accumulator of inverses (LIFO recover).
     dispose: Accumulator,
@@ -55,16 +58,21 @@ pub const Context = struct {
     /// so a derived child gets a fresh table and recovery just discards it.
     intercepts: interception.InterceptTable,
 
-    /// Create a root context with a freshly owned store.
+    /// Create a root context with a freshly owned store and provider table.
     pub fn init(allocator: std.mem.Allocator) !*Self {
         const store = try allocator.create(Store);
         errdefer allocator.destroy(store);
         store.* = Store.init(allocator);
         errdefer store.deinit();
+        const providers = try allocator.create(interception.ProviderTable);
+        errdefer allocator.destroy(providers);
+        providers.* = interception.ProviderTable.init(allocator);
+        errdefer providers.deinit();
         const self = try allocator.create(Self);
         self.* = .{
             .allocator = allocator,
             .store = store,
+            .providers = providers,
             .owns_store = true,
             .dispose = Accumulator.init(allocator),
             .parent = null,
@@ -82,6 +90,8 @@ pub const Context = struct {
         if (self.owns_store) {
             self.store.deinit();
             self.allocator.destroy(self.store);
+            self.providers.deinit();
+            self.allocator.destroy(self.providers);
         }
         self.allocator.destroy(self);
     }
@@ -150,9 +160,78 @@ pub const Context = struct {
     /// A component reads this and merges it with its own declared metadata
     /// before applying the provider (Definition 27's σ(k)(μ ⊕ₖ 𝜄(k))). The
     /// provider application itself is the component's concern; the context
-    /// supplies the carried half of the merge.
+    /// supplies the carried half of the merge. For the automated path that
+    /// performs the whole Def 27 get in one call, see getIntercepted.
     pub fn interceptOf(self: *const Self, key: Key) ?*anyopaque {
         return self.intercepts.get(key.name);
+    }
+
+    /// ctx.provide(key, provider) — register the provider function σ(k) : ℳₖ →
+    /// 𝒱ₖ (Definition 26) for a key. A REVERTIBLE effect: tracks the
+    /// unregister as an inverse, so unloading the provider removes σ(k)
+    /// (Theorem 7/16). Single-source: a second provider for the same key is
+    /// error.ProviderAlreadyRegistered (mirrors the store's O-Insert).
+    pub fn provide(self: *Self, key: Key, provider: interception.Provider) !void {
+        try self.providers.register(key.name, provider);
+        errdefer self.providers.unregister(key.name);
+
+        const inv_state = try self.allocator.create(Key);
+        errdefer self.allocator.destroy(inv_state);
+        inv_state.* = key;
+        const Impl = struct {
+            fn call(state: *anyopaque, ctx: *Self) void {
+                const k: *Key = @ptrCast(@alignCast(state));
+                ctx.providers.unregister(k.name);
+            }
+            fn deinit(state: *anyopaque, allocator: std.mem.Allocator) void {
+                allocator.destroy(@as(*Key, @ptrCast(@alignCast(state))));
+            }
+        };
+        try self.dispose.track(.{ .state = inv_state, .call = Impl.call, .deinit = Impl.deinit });
+    }
+
+    /// ctx.getIntercepted(V, key, declared) — Definition 27's get, automated:
+    /// evaluate σ(k)(μ ⊕ₖ 𝜄(k)). It merges the component-declared metadata μ
+    /// (`declared`, may be null = εₖ) with the context-carried 𝜄(k), then
+    /// applies the registered provider σ(k) to the result.
+    ///
+    /// The merge uses whichever ⊕ₖ was registered when the context was
+    /// intercepted; if only one side has metadata, that side is used directly
+    /// (no merge hook needed). The caller owns the returned value and must free
+    /// it with the provider's `free` (returned alongside via getProvider), or
+    /// use `freeIntercepted`. Returns error.NoProvider if σ(k) is unregistered.
+    ///
+    /// `V` is the provider's value type; the opaque result is cast to `*V`.
+    pub fn getIntercepted(
+        self: *Self,
+        comptime V: type,
+        key: Key,
+        declared: ?*anyopaque,
+    ) !interception.Resolved(V) {
+        const provider = self.providers.get(key.name) orelse return error.NoProvider;
+        const carried = self.intercepts.get(key.name);
+
+        // Compute μ ⊕ₖ 𝜄(k). Four cases over which sides carry metadata.
+        var merged: ?*anyopaque = null;
+        var merged_owned = false; // whether we must free `merged` after apply
+        if (declared != null and carried != null) {
+            // Both present: use the key's registered merge hook. Right-biased
+            // toward the carried 𝜄(k) (enclosing context wins, Def 27).
+            const merge = self.intercepts.mergeOf(key.name).?;
+            merged = try merge(self.allocator, declared, carried.?);
+            merged_owned = true;
+        } else if (carried != null) {
+            merged = carried; // 𝜄(k) only (borrowed; owned by the 𝜄 table)
+        } else {
+            merged = declared; // μ only, or εₖ if both null (borrowed by caller)
+        }
+        defer if (merged_owned) {
+            // Free the merge result using the carried entry's free hook.
+            self.intercepts.freeMerged(key.name, merged.?);
+        };
+
+        const value = try provider.apply(self.allocator, merged);
+        return .{ .value = @ptrCast(@alignCast(value)), .free = provider.free };
     }
 
     // ── Events (§3.4.2 tagged registry; Def 8 revertible effect) ─────
@@ -247,6 +326,7 @@ pub const Context = struct {
         child.* = .{
             .allocator = self.allocator,
             .store = self.store, // shared by reference
+            .providers = self.providers, // shared by reference (root owns it)
             .owns_store = false,
             .dispose = Accumulator.init(self.allocator),
             .parent = self,
@@ -614,4 +694,111 @@ fn interceptUnderOom(allocator: std.mem.Allocator) !void {
 
 test "OOM safety: ctx.intercept leaks nothing on any allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, interceptUnderOom, .{});
+}
+
+// ── Definition 27 get: σ(k)(μ ⊕ₖ 𝜄(k)) via ctx.provide/getIntercepted ───
+//
+// A provider that resolves the Flags bits into a concrete value: here it just
+// returns the bitset count, so the resolved value depends on BOTH the
+// component-declared μ and the context-carried 𝜄(k) after merge.
+
+fn flagsProvider(a: std.mem.Allocator, metadata: ?*anyopaque) anyerror!*anyopaque {
+    const out = try a.create(u32);
+    out.* = if (metadata) |m| @popCount(@as(*Flags, @ptrCast(@alignCast(m))).bits) else 0;
+    return out;
+}
+fn flagsProviderFree(value: *anyopaque, a: std.mem.Allocator) void {
+    a.destroy(@as(*u32, @ptrCast(@alignCast(value))));
+}
+
+test "Definition 27 get: σ(k) applied to μ ⊕ₖ 𝜄(k) (both sides merged)" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const k = Key.of(u32, "db");
+    try ctx.provide(k, .{ .apply = flagsProvider, .free = flagsProviderFree });
+
+    // Context-carried 𝜄(k) = bit 0b01.
+    const carried = try Flags.create(ctx.allocator, 0b001);
+    try ctx.intercept(k, carried, Flags.mergeFn, Flags.freeFn);
+
+    // Component-declared μ = bits 0b110. Merge (union) → 0b111 → popcount 3.
+    var declared = Flags{ .bits = 0b110 };
+    const resolved = try ctx.getIntercepted(u32, k, &declared);
+    defer resolved.deinit(ctx.allocator);
+    try std.testing.expectEqual(@as(u32, 3), resolved.value.*);
+}
+
+test "Definition 27 get: εₖ — no μ and no 𝜄(k) resolves the provider's empty value" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const k = Key.of(u32, "db");
+    try ctx.provide(k, .{ .apply = flagsProvider, .free = flagsProviderFree });
+
+    const resolved = try ctx.getIntercepted(u32, k, null); // μ = εₖ, 𝜄(k) = εₖ
+    defer resolved.deinit(ctx.allocator);
+    try std.testing.expectEqual(@as(u32, 0), resolved.value.*);
+}
+
+test "Definition 27 get: carried 𝜄(k) only (no component μ)" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const k = Key.of(u32, "db");
+    try ctx.provide(k, .{ .apply = flagsProvider, .free = flagsProviderFree });
+    const carried = try Flags.create(ctx.allocator, 0b101); // popcount 2
+    try ctx.intercept(k, carried, Flags.mergeFn, Flags.freeFn);
+
+    const resolved = try ctx.getIntercepted(u32, k, null);
+    defer resolved.deinit(ctx.allocator);
+    try std.testing.expectEqual(@as(u32, 2), resolved.value.*);
+}
+
+test "getIntercepted on an unprovided key is error.NoProvider" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+    const k = Key.of(u32, "absent");
+    try std.testing.expectError(error.NoProvider, ctx.getIntercepted(u32, k, null));
+}
+
+test "Definition 26: ctx.provide is revertible — recover unregisters σ(k)" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const k = Key.of(u32, "db");
+    try ctx.provide(k, .{ .apply = flagsProvider, .free = flagsProviderFree });
+    try std.testing.expect(ctx.providers.get(k.name) != null);
+
+    // Recover: the provider's inverse unregisters σ(k).
+    ctx.dispose.recover(ctx);
+    try std.testing.expect(ctx.providers.get(k.name) == null);
+    try std.testing.expectError(error.NoProvider, ctx.getIntercepted(u32, k, null));
+}
+
+test "ctx.provide is single-source: a second provider is rejected" {
+    const ctx = try Context.init(std.testing.allocator);
+    defer ctx.deinit();
+    const k = Key.of(u32, "db");
+    try ctx.provide(k, .{ .apply = flagsProvider, .free = flagsProviderFree });
+    try std.testing.expectError(
+        error.ProviderAlreadyRegistered,
+        ctx.provide(k, .{ .apply = flagsProvider, .free = flagsProviderFree }),
+    );
+}
+
+fn getInterceptedUnderOom(allocator: std.mem.Allocator) !void {
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+    const k = Key.of(u32, "db");
+    try ctx.provide(k, .{ .apply = flagsProvider, .free = flagsProviderFree });
+    const carried = try Flags.create(ctx.allocator, 0b001);
+    try ctx.intercept(k, carried, Flags.mergeFn, Flags.freeFn);
+    var declared = Flags{ .bits = 0b110 };
+    const resolved = try ctx.getIntercepted(u32, k, &declared);
+    resolved.deinit(ctx.allocator);
+}
+
+test "OOM safety: ctx.provide + getIntercepted leak nothing on any failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, getInterceptedUnderOom, .{});
 }

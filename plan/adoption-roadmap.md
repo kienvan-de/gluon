@@ -124,11 +124,22 @@ purely additive.
   precondition (Def 52 cascade, Thm 70 ordering). Non-gating deps need their own
   soundness story. See §5 "Held back on fidelity grounds."
 
-**2. Transparent interception merge inside `get`** — ★★★★★
+**2. Transparent interception merge inside `get`** — ✅✅ **ADOPTED (2026-10)**
 - Automate Def 27's `σ(k)(μ ⊕ 𝜄(k))`: a `getIntercepted(key, declared_meta)`
   applies a provider function to the merged metadata, instead of leaving the
   merge to the component. We already have `InterceptTable` + `interceptOf`.
 - *Value:* Medium. Completes Def 26/27 faithfully.
+- **Shipped:** `ProviderTable` + `Provider` + `Resolved(V)` in
+  `src/coeffect/interception.zig`; `ctx.provide(key, provider)` and
+  `ctx.getIntercepted(V, key, declared)` in `src/context/context.zig`. The
+  provider table is shared with the store's lifetime (root owns, children
+  borrow). `ctx.provide` is a revertible effect (registers σ(k), tracks
+  unregister — Def 26, Thm 7/16) and single-source
+  (`error.ProviderAlreadyRegistered`, mirroring the store's O-Insert).
+  `getIntercepted` performs the full Def 27 get: merge μ ⊕ₖ 𝜄(k) right-biased
+  toward the carried 𝜄(k), then apply σ(k); handles all four εₖ cases. 9 new
+  tests (provider-table unit + context integration + OOM), 99 total passing
+  Debug + ReleaseSafe. `interceptOf` is retained as the lower-level accessor.
 
 **3. Events-as-revertible-effects (`on`/`emit`)** — ✅✅ **ADOPTED (2026-10)**
 - An event bus: `ctx.on(event, handler)` returns a disposer (tracked effect);

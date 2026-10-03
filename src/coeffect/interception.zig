@@ -22,6 +22,14 @@
 //! overwrite, set-valued fields union — Def 27 note). We provide a generic
 //! Metadata table and a right-biased merge hook; concrete key metadata types
 //! plug in via the comptime key registry (Phase 8).
+//!
+//! Provider table + automated get (roadmap #2): the provider function
+//! σ(k) : ℳₖ → 𝒱ₖ is realized by `ProviderTable`, and Context.getIntercepted
+//! performs the whole Definition 27 get — σ(k)(μ ⊕ₖ 𝜄(k)) — in one call: merge
+//! the component-declared μ with the context-carried 𝜄(k) (right-biased toward
+//! 𝜄(k)), then apply σ(k). Previously the merge+apply was left to the
+//! component (only `interceptOf` exposed the carried half); it is now
+//! automated at the access site, matching Def 27 directly.
 
 const std = @import("std");
 
@@ -34,12 +42,39 @@ pub const Merge = *const fn (
     incoming: *anyopaque,
 ) anyerror!*anyopaque;
 
+/// A provider function σ(k) : ℳₖ → 𝒱ₖ (Definition 26). Given the merged
+/// metadata (μ ⊕ₖ 𝜄(k)), it computes the resolved value the holder observes.
+/// Both metadata and value are opaque; the function knows the concrete types.
+/// `metadata` may be null (εₖ — no component-declared nor context-carried
+/// metadata). The returned value is owned by the caller (freed via the
+/// provider's `free`).
+pub const Provider = struct {
+    /// σ(k): metadata ↦ freshly-owned value.
+    apply: *const fn (allocator: std.mem.Allocator, metadata: ?*anyopaque) anyerror!*anyopaque,
+    /// Releases a value produced by `apply`.
+    free: *const fn (value: *anyopaque, allocator: std.mem.Allocator) void,
+};
+
 /// A metadata entry: an opaque value plus the hooks to merge and free it.
 const Entry = struct {
     value: *anyopaque,
     merge: Merge,
     free: *const fn (value: *anyopaque, allocator: std.mem.Allocator) void,
 };
+
+/// The typed result of Definition 27's get σ(k)(μ ⊕ₖ 𝜄(k)): a value pointer the
+/// caller owns, plus the hook to release it.
+pub fn Resolved(comptime V: type) type {
+    return struct {
+        value: *V,
+        free: *const fn (value: *anyopaque, allocator: std.mem.Allocator) void,
+
+        /// Release the resolved value.
+        pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+            self.free(@ptrCast(self.value), allocator);
+        }
+    };
+}
 
 /// The interception table 𝜄 : key name → metadata (Definition 26). Carried by
 /// a context; a derived child context gets its own table that inherits (by
@@ -101,6 +136,56 @@ pub const InterceptTable = struct {
     pub fn get(self: *const Self, key_name: []const u8) ?*anyopaque {
         if (self.entries.get(key_name)) |e| return e.value;
         return null;
+    }
+
+    /// The merge hook ⊕ₖ registered for a key (via a prior intercept), or null
+    /// if the key carries no metadata. Needed to merge a component's declared
+    /// μ with the carried 𝜄(k) at access time (Definition 27 get).
+    pub fn mergeOf(self: *const Self, key_name: []const u8) ?Merge {
+        if (self.entries.get(key_name)) |e| return e.merge;
+        return null;
+    }
+
+    /// Free a value produced by this key's merge hook, using the key's `free`.
+    /// Used to release the transient μ ⊕ₖ 𝜄(k) result after a provider applied
+    /// it (Definition 27 get). No-op if the key is absent.
+    pub fn freeMerged(self: *const Self, key_name: []const u8, value: *anyopaque) void {
+        if (self.entries.get(key_name)) |e| e.free(value, self.allocator);
+    }
+};
+
+/// The provider table σ : (k:K) → (ℳₖ → 𝒱ₖ) (Definition 26). Registered by the
+/// component that provides a key; shared across contexts (like the store), so
+/// a derived child resolves the same provider but against its own carried 𝜄.
+pub const ProviderTable = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    providers: std.StringHashMapUnmanaged(Provider),
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return .{ .allocator = allocator, .providers = .empty };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.providers.deinit(self.allocator);
+    }
+
+    /// Register σ(k) for a key. Fails if a provider already exists (single
+    /// source, mirroring the store's O-Insert provision disjointness).
+    pub fn register(self: *Self, key_name: []const u8, provider: Provider) !void {
+        const gop = try self.providers.getOrPut(self.allocator, key_name);
+        if (gop.found_existing) return error.ProviderAlreadyRegistered;
+        gop.value_ptr.* = provider;
+    }
+
+    /// Remove σ(k) (the inverse of register, run on provider teardown).
+    pub fn unregister(self: *Self, key_name: []const u8) void {
+        _ = self.providers.remove(key_name);
+    }
+
+    pub fn get(self: *const Self, key_name: []const u8) ?Provider {
+        return self.providers.get(key_name);
     }
 };
 
@@ -188,4 +273,49 @@ fn interceptScenario(allocator: std.mem.Allocator) !void {
 
 test "OOM safety: intercept merge path leaks nothing on any failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, interceptScenario, .{});
+}
+
+// ── Provider table σ(k) : ℳₖ → 𝒱ₖ (Definition 26) ──────────────
+//
+// A provider that counts the flags in a FlagSet metadata (demonstrating that
+// the resolved value depends on the merged metadata). εₖ metadata yields 0.
+
+fn countProvider(allocator: std.mem.Allocator, metadata: ?*anyopaque) anyerror!*anyopaque {
+    const out = try allocator.create(usize);
+    out.* = if (metadata) |m| @as(*FlagSet, @ptrCast(@alignCast(m))).flags.items.len else 0;
+    return out;
+}
+fn countFree(value: *anyopaque, allocator: std.mem.Allocator) void {
+    allocator.destroy(@as(*usize, @ptrCast(@alignCast(value))));
+}
+
+test "Definition 26: register/get a provider σ(k), reject double registration" {
+    var table = ProviderTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    try table.register("db", .{ .apply = countProvider, .free = countFree });
+    try std.testing.expect(table.get("db") != null);
+    try std.testing.expectError(error.ProviderAlreadyRegistered, table.register("db", .{ .apply = countProvider, .free = countFree }));
+
+    table.unregister("db");
+    try std.testing.expect(table.get("db") == null);
+}
+
+test "Definition 27: σ(k) applied to merged metadata yields the resolved value" {
+    var table = ProviderTable.init(std.testing.allocator);
+    defer table.deinit();
+    try table.register("db", .{ .apply = countProvider, .free = countFree });
+
+    const md = try FlagSet.create(std.testing.allocator, &.{ "read-only", "audited" });
+    defer FlagSet.freeFn(md, std.testing.allocator);
+
+    const p = table.get("db").?;
+    const value = try p.apply(std.testing.allocator, md);
+    defer p.free(value, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), @as(*usize, @ptrCast(@alignCast(value))).*);
+
+    // εₖ metadata (null) resolves to the provider's zero value.
+    const empty = try p.apply(std.testing.allocator, null);
+    defer p.free(empty, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), @as(*usize, @ptrCast(@alignCast(empty))).*);
 }
