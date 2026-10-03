@@ -53,6 +53,14 @@ The async-inertia gap is therefore **no longer a hard language limitation** — 
 is a dependency-maturity tradeoff (`std.Io` is new and will churn across
 0.16.x → 0.17).
 
+> **Supersedes plan/building-blocks.md decision C2.** That document (an archived
+> record of the completed build) committed to a synchronous explicit state
+> machine on the premise that stable Zig had no async. That premise is now
+> outdated. building-blocks.md is intentionally left unchanged as a historical
+> record; this roadmap is the live view. The synchronous model it describes
+> remains correct — it is the degenerate schedule, and is what the current
+> implementation uses — so async is an additive upgrade, not a correction.
+
 ---
 
 ## 3. Deep dive: async inertia (§4.4) → `std.Io`

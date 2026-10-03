@@ -167,13 +167,6 @@ pub const Inverse = struct {
 
 ### C2. No `async`/`await` → Explicit Lifecycle State Machine
 
-> 🔄 **Superseded for future work (2026-10):** this decision assumed stable Zig
-> has no async. **Zig 0.16 ships `std.Io`** (`async`/`concurrent`/`await`/
-> `cancel`/`Group`/`Future`, with `Io.Threaded` and `Io.Uring` implementations).
-> The async-inertia model is now adoptable — see `plan/adoption-roadmap.md` §3.
-> The synchronous model below remains correct (it is the degenerate schedule)
-> and is what the current implementation uses; async is an additive upgrade.
-
 Stable Zig has no `async`/`await`. The inertia model (§4.4, §5.1.3 `fiber.inertia`) is **core to correctness, not optional** — it is what makes `L-Divert`/reload-unload chaining safe. Commit to an **explicit state machine driven by a scheduler queue**, not language coroutines.
 
 - `fiber.inertia` becomes a `?TransitionHandle` (index into a pending-transition queue), not a coroutine handle.
