@@ -73,6 +73,14 @@ pub const View = component.View;
 pub const registry = @import("component/registry.zig");
 pub const Registry = registry.Registry;
 
+pub const scheduler = @import("scheduler/scheduler.zig");
+pub const Scheduler = scheduler.Scheduler;
+pub const Blocking = scheduler.Blocking;
+pub const CancelToken = scheduler.CancelToken;
+
+pub const evented = @import("scheduler/evented.zig");
+pub const Evented = evented.Evented;
+
 pub const lifecycle = @import("component/lifecycle.zig");
 pub const Orchestrator = lifecycle.Orchestrator;
 
@@ -89,6 +97,8 @@ test {
     _ = spec;
     _ = component;
     _ = registry;
+    _ = scheduler;
+    _ = evented;
     _ = lifecycle;
     _ = interception;
     _ = loader;

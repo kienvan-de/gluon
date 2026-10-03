@@ -198,7 +198,24 @@ purely additive.
 
 ### Tier 3 — Newly ready in 0.16 · stabilizing (churn risk)
 
-**6. Async inertial lifecycle via `std.Io`** — ★★★☆☆ *(the big one)*
+**6. Async inertial lifecycle via `std.Io`** — ✅✅ **ADOPTED (2026-10)** *(the big one)*
+- **Shipped (3 steps, see `plan/async-inertia-design.md`):** a Gluon-owned
+  Scheduler seam (`src/scheduler/scheduler.zig`) isolating `std.Io` to one
+  file, with two backends: `.blocking` (default; run-to-completion, zero
+  `std.Io` dependency — the paper's degenerate schedule) and `.evented`
+  (`src/scheduler/evented.zig`; wraps `std.Io` async/await/cancel, runs on
+  `std.Io.Threaded`/`Evented`). The orchestrator routes `reload`/`unload`
+  through the seam (`fiber` recover is a must-complete `run`; apply+execute is
+  a fallible `spawn`/`await`), awaits in-flight dependents/children in the
+  drain + Def 52 cascade (Thm 70 ordering preserved under suspension), and ORs
+  a cancel token into the reload guard (L-Divert abort → route to unload →
+  re-converge). The orchestrator never imports `std.Io`. All 121 prior tests
+  pass unchanged under `.blocking` (behavior-preserving refactor); +10 new
+  (seam unit, `.evented` integration, L-Divert cancel), 131 total Debug +
+  ReleaseSafe. **Churn containment realized:** if `std.Io` changes, only
+  `evented.zig` changes; `.blocking` keeps the library working regardless.
+
+  _Original assessment (kept for context):_
 - Thread `io: Io` through the orchestrator; make `reload`/`unload` async with
   `fiber.inertia: ?Future(void)`; drain dependents with `Io.Group`; abort
   L-Divert with `Future.cancel`. Primitives map 1:1 to the paper (§3 above).

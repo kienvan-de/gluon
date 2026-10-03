@@ -29,6 +29,7 @@ const reg_mod = @import("registry.zig");
 const Context = @import("../context/context.zig").Context;
 const effect_iter = @import("../effect/effect_iter.zig");
 const store_mod = @import("../coeffect/store.zig");
+const sched_mod = @import("../scheduler/scheduler.zig");
 
 pub const Fiber = comp.Fiber;
 pub const FiberId = comp.FiberId;
@@ -57,10 +58,23 @@ pub const LifecycleError = error{
 pub const Orchestrator = struct {
     const Self = @This();
 
+    /// Task state for a scheduled transition: the orchestrator + the fiber the
+    /// transition acts on, plus whether the task observed a cancel request.
+    /// Passed as the closure-free `state` to a TaskFn.
+    const TransitionCtx = struct { self: *Self, fiber: *Fiber, cancelled: bool = false };
+
     allocator: std.mem.Allocator,
     registry: Registry,
     /// The root context whose store is Σ_γ; all fiber contexts derive from it.
     root_ctx: *Context,
+    /// The default `.blocking` scheduler backend (owned); step 3 adds an
+    /// `.evented` alternative. Its address is stable once the Orchestrator is
+    /// stored, so the Scheduler seam is built on demand from it (see
+    /// `scheduler`) rather than cached — avoiding a self-referential field.
+    blocking: sched_mod.Blocking,
+    /// An optional override: when non-null, transitions route through this
+    /// scheduler instead of the owned `.blocking` backend (step 3 `.evented`).
+    scheduler_override: ?sched_mod.Scheduler,
 
     pub fn init(allocator: std.mem.Allocator) !Self {
         const root_ctx = try Context.init(allocator);
@@ -68,7 +82,23 @@ pub const Orchestrator = struct {
             .allocator = allocator,
             .registry = Registry.init(allocator),
             .root_ctx = root_ctx,
+            .blocking = sched_mod.Blocking.init(allocator),
+            .scheduler_override = null,
         };
+    }
+
+    /// The scheduler seam every lifecycle transition is spawned on: the
+    /// override if set, else the owned `.blocking` backend (run-to-completion
+    /// — the paper's degenerate, always-valid schedule). Built on demand so no
+    /// field holds a pointer into `self` (which would break on move).
+    fn scheduler(self: *Self) sched_mod.Scheduler {
+        return self.scheduler_override orelse self.blocking.scheduler();
+    }
+
+    /// Route transitions through `s` instead of the default `.blocking`
+    /// backend. `s` must outlive the Orchestrator. (Step 3 `.evented`.)
+    pub fn useScheduler(self: *Self, s: sched_mod.Scheduler) void {
+        self.scheduler_override = s;
     }
 
     pub fn deinit(self: *Self) void {
@@ -140,35 +170,61 @@ pub const Orchestrator = struct {
         if (fiber.committed) |c| c.deinit(self.allocator);
         fiber.committed = try target0.clone(self.allocator);
 
-        // Build and run the effect iterator against the fiber's own context.
-        // The guard holds the transition only while target is unchanged
-        // (Alg 5 line 15 guard: fiber.target == target0) — realizing L-Divert.
+        // Run the apply+execute body as a scheduler task (Alg 5 lines 14–16).
+        // In `.blocking` this completes inline; `.evented` (step 3) suspends
+        // here. The task observes a cancel token so a divert aborts it at a
+        // step boundary (L-Divert); the body also polls targetGuard.
+        var tc = TransitionCtx{ .self = self, .fiber = fiber };
+        const task = try self.scheduler().spawn(runReload, &tc);
+        const outcome = self.scheduler().awaitTask(task);
+        // markFailed already ran inside the task for component failures; only
+        // infrastructure errors (OOM) propagate as the task result.
+        try outcome;
+        if (fiber.phase == .failed) return;
+
+        // Did the target hold throughout AND the transition was not cancelled?
+        // (Alg 5 line 17.) A cancel (L-Divert, §4.2.2) aborts mid-activation, so
+        // we must not settle ACTIVE on a half-installed effect — route to unload
+        // to recover whatever was installed (Cor 69 leaves nothing).
+        const held = fiber.target != null and fiber.target.?.active and fiber.target.?.eql(fiber.committed.?);
+        if (held and !tc.cancelled) {
+            fiber.phase = .active;
+            // notify dependents that this fiber's provisions are now available.
+            try self.notify(fiber.component.provide);
+        } else {
+            // Target changed or cancelled: chain into unload (inertial, Alg 5 L21).
+            fiber.in_transition = false;
+            try self.unload(fiber);
+        }
+    }
+
+    /// The task body of reload (Alg 5 lines 14–16): build and drive the effect
+    /// iterator against the fiber's own context. A component failure routes to
+    /// FAILED here (§4.4); only infrastructure OOM is returned as the task
+    /// result. The cancel `token` ORs into the iterator guard so a divert
+    /// aborts at a step boundary (L-Divert).
+    fn runReload(state: *anyopaque, token: *const sched_mod.CancelToken) sched_mod.TaskResult {
+        const tc: *TransitionCtx = @ptrCast(@alignCast(state));
+        const self = tc.self;
+        const fiber = tc.fiber;
+
         const iter = fiber.component.apply(fiber.ctx, fiber.config) catch |err| {
-            // Infrastructure OOM is propagated, not swallowed as a component
-            // failure; a genuine component refusal routes to FAILED (§4.4).
             if (err == error.OutOfMemory) return error.OutOfMemory;
             self.markFailed(fiber, err);
             return;
         };
         defer iter.deinit(fiber.ctx.allocator);
 
-        const guard = targetGuard(fiber);
+        var gs = GuardState{ .fiber = fiber, .token = token };
+        const guard = cancelableTargetGuard(&gs);
         effect_iter.execute(Context, iter, guard, fiber.ctx.allocator, fiber.ctx, &fiber.ctx.dispose) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             self.markFailed(fiber, err);
             return;
         };
-
-        // Did the target hold throughout? (Alg 5 line 17.)
-        if (fiber.target != null and fiber.target.?.active and fiber.target.?.eql(fiber.committed.?)) {
-            fiber.phase = .active;
-            // notify dependents that this fiber's provisions are now available.
-            try self.notify(fiber.component.provide);
-        } else {
-            // Target changed under us: chain into unload (inertial, Alg 5 L21).
-            fiber.in_transition = false;
-            try self.unload(fiber);
-        }
+        // Record a cancel so reload routes to unload rather than settling
+        // ACTIVE on a half-installed effect (L-Divert on cancel, §4.2.2).
+        tc.cancelled = token.requested();
     }
 
     /// §4.4 Failure: a component raise aborts the activation. Recover whatever
@@ -201,8 +257,13 @@ pub const Orchestrator = struct {
         // (and transitively its grandchildren) before we recover this fiber.
         try self.retireChildren(fiber.id);
 
-        // Apply the accumulator: recover this fiber's effects (LIFO).
-        fiber.ctx.dispose.recover(fiber.ctx);
+        // Apply the accumulator: recover this fiber's effects (LIFO). Uses the
+        // scheduler's must-complete `run` (allocation-free, infallible): an
+        // async teardown inverse (e.g. closing a connection pool) still
+        // suspends here in `.evented` (step 3), but recover — which must always
+        // run or inverses would leak — can never fail to schedule.
+        var tc = TransitionCtx{ .self = self, .fiber = fiber };
+        self.scheduler().run(runRecover, &tc) catch {};
 
         // Discard the committed view (L-Unload last act).
         if (fiber.committed) |c| {
@@ -216,6 +277,14 @@ pub const Orchestrator = struct {
             fiber.in_transition = false;
             try self.reload(fiber);
         }
+    }
+
+    /// The task body of unload's recover step: apply the fiber's accumulator
+    /// (LIFO revert, Theorem 16). Infallible — recover never errors — so it
+    /// always returns success as the TaskResult.
+    fn runRecover(state: *anyopaque, _: *const sched_mod.CancelToken) sched_mod.TaskResult {
+        const tc: *TransitionCtx = @ptrCast(@alignCast(state));
+        tc.fiber.ctx.dispose.recover(tc.fiber.ctx);
     }
 
     /// Def 52: retire and deactivate every fiber instantiated under `parent_id`
@@ -309,6 +378,29 @@ pub const Orchestrator = struct {
             }
         };
         return .{ .state = fiber, .poll = Impl.poll };
+    }
+
+    /// Guard state for a cancelable target guard: carries the fiber and the
+    /// scheduler's cancel token. Lives as a stack local in the reload task body
+    /// (which outlives the `execute()` it guards).
+    const GuardState = struct { fiber: *Fiber, token: *const sched_mod.CancelToken };
+
+    /// As `targetGuard`, but also trips if the scheduler requested cancelation
+    /// (the cooperative cancelation point, §4.2.2 L-Divert). Stays active while
+    /// the target holds AND no cancel is pending. In `.blocking` the token
+    /// never trips, so this is exactly `targetGuard`. `gs` must outlive the
+    /// guarded `execute()` call.
+    fn cancelableTargetGuard(gs: *GuardState) effect_iter.Guard {
+        const Impl = struct {
+            fn poll(state: *anyopaque) bool {
+                const s: *GuardState = @ptrCast(@alignCast(state));
+                if (s.token.requested()) return false; // cancel → stop
+                const t = s.fiber.target orelse return false;
+                const c = s.fiber.committed orelse return false;
+                return t.active and t.eql(c);
+            }
+        };
+        return .{ .state = gs, .poll = Impl.poll };
     }
 
     // ── Orchestration (§4.2.1) ────────────────────────────────────
@@ -628,4 +720,108 @@ test "default witness is commutative: existing simple components still load" {
     // providerComponent sets no witness → defaults to trivial/commutative.
     const id = try orch.load(provider("db", 1), comp.root);
     try std.testing.expectEqual(comp.Phase.active, orch.registry.get(id).?.phase);
+}
+
+// ── `.evented` scheduler integration (roadmap #6, step 3) ─────────
+//
+// The lifecycle must behave identically under the `.evented` backend (which
+// routes transitions through std.Io async/await) as under `.blocking`. These
+// run a real std.Io.Threaded and assert the same observable outcomes.
+
+const evented_mod = @import("../scheduler/evented.zig");
+
+test ".evented: a provider loads and activates exactly as under .blocking" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var backend = evented_mod.Evented.init(std.testing.allocator, threaded.io());
+
+    var orch = try Orchestrator.init(std.testing.allocator);
+    defer orch.deinit();
+    orch.useScheduler(backend.scheduler()); // route transitions through std.Io
+
+    const kdb = Key.of(u32, "db");
+    const id = try orch.load(provider("db", 5432), comp.root);
+    try std.testing.expectEqual(comp.Phase.active, orch.registry.get(id).?.phase);
+    try std.testing.expectEqual(@as(u32, 5432), try orch.root_ctx.get(u32, kdb));
+}
+
+test ".evented: reactive activation + ordered teardown match .blocking" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var backend = evented_mod.Evented.init(std.testing.allocator, threaded.io());
+
+    var orch = try Orchestrator.init(std.testing.allocator);
+    defer orch.deinit();
+    orch.useScheduler(backend.scheduler());
+
+    const kdb = Key.of(u32, "db");
+    // Consumer first (inactive), then provider activates it reactively.
+    const consumer_id = try orch.load(consumer("db"), comp.root);
+    try std.testing.expectEqual(comp.Phase.inactive, orch.registry.get(consumer_id).?.phase);
+    const provider_id = try orch.load(provider("db", 1), comp.root);
+    try std.testing.expectEqual(comp.Phase.active, orch.registry.get(consumer_id).?.phase);
+
+    // Retiring the provider drains the dependent first (Thm 70), then recovers.
+    try orch.unloadFiber(provider_id);
+    try std.testing.expectEqual(comp.Phase.inactive, orch.registry.get(consumer_id).?.phase);
+    try std.testing.expect(!orch.isProvided(kdb));
+}
+
+// A test scheduler that trips the cancel token BEFORE running the body, so the
+// reload guard sees cancelation at the first step boundary (L-Divert abort).
+// Deterministic (no concurrency): proves the cancel token reaches the guard.
+const CancelingScheduler = struct {
+    // Cancel only the FIRST spawned task (one L-Divert abort), as a real
+    // canceler would; subsequent transitions run normally. An always-cancel
+    // scheduler would livelock (reload→unload→reload…), which is a property of
+    // that pathological scheduler, not of the lifecycle.
+    flag: bool = true,
+    fn scheduler(self: *@This()) sched_mod.Scheduler {
+        return .{ .vtable = &vt, .context = self };
+    }
+    const vt = sched_mod.Scheduler.VTable{
+        .spawn = spawnImpl,
+        .awaitTask = awaitImpl,
+        .cancelTask = awaitImpl,
+        .run = runImpl,
+    };
+    var result_slot: sched_mod.TaskResult = {};
+    fn spawnImpl(context: *anyopaque, run: sched_mod.TaskFn, state: *anyopaque) std.mem.Allocator.Error!sched_mod.Task {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const token = sched_mod.CancelToken{ .flag = &self.flag };
+        self.flag = false; // one-shot: only the first task is cancelled
+        result_slot = run(state, &token);
+        return .{ .handle = self };
+    }
+    fn awaitImpl(_: *anyopaque, _: sched_mod.Task) sched_mod.TaskResult {
+        return result_slot;
+    }
+    fn runImpl(context: *anyopaque, run: sched_mod.TaskFn, state: *anyopaque) sched_mod.TaskResult {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const token = sched_mod.CancelToken{ .flag = &self.flag };
+        return run(state, &token);
+    }
+};
+
+test "§4.2.2 L-Divert: a cancel aborts the in-flight reload, then re-settles" {
+    var canceler = CancelingScheduler{};
+    var orch = try Orchestrator.init(std.testing.allocator);
+    defer orch.deinit();
+    orch.useScheduler(canceler.scheduler());
+
+    // The one-shot canceler trips the token on the FIRST reload: the guard
+    // stops the iterator at the first step boundary (nothing installed —
+    // Cor 69), reload sees the cancel and routes to unload (recover is a
+    // no-op on the empty accumulator), which then chains back to reload
+    // because the target is still satisfied. The second reload runs normally.
+    const kdb = Key.of(u32, "db");
+    const id = try orch.load(provider("db", 1), comp.root);
+
+    // The cancel token reached the iterator guard (first attempt installed
+    // nothing), and the inertial chaining re-settled the fiber ACTIVE against
+    // the still-valid target — the L-Divert "abort then re-converge" behavior.
+    const f = orch.registry.get(id).?;
+    try std.testing.expectEqual(comp.Phase.active, f.phase);
+    try std.testing.expect(orch.isProvided(kdb));
+    try std.testing.expectEqual(@as(u32, 1), try orch.root_ctx.get(u32, kdb));
 }
