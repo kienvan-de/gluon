@@ -14,23 +14,43 @@ This document maps every formal construct in the paper to a concrete Zig buildin
 | 3 | Coeffects: TypeId, store Σiso, Context Γ∞, spec/satisfaction/classify | `context/type_id.zig`, `coeffect/store.zig`, `context/context.zig`, `coeffect/spec.zig` | ✅ |
 | 4 | Component, Fiber, lifecycle (Alg 5), notify (Alg 3), orchestration | `component/component.zig`, `component/registry.zig`, `component/lifecycle.zig` | ✅ |
 | 5 | Orchestration + metatheory (guard, ordering, confluence) | folded into Phase 4 | ✅ |
-| 6 | Interception (isolation already in store) | `coeffect/interception.zig` | ✅ |
+| 6 | Interception wired into Context (Def 26/27); isolation in store | `coeffect/interception.zig`, `context/context.zig` | ✅ |
 | 6.5 | Failure handling (FAILED state) | folded into `lifecycle.zig` (`markFailed`) | ✅ |
 | 7 | Loader: reconciliation + HMR | `loader/loader.zig` | ✅ |
-| 8 | Commutativity witnesses + comptime key gate | `coeffect/key_registry.zig` | ✅ |
+| 8 | Commutativity witnesses + comptime gate + load enforcement (Thm 47) | `coeffect/key_registry.zig`, `component/lifecycle.zig` | ✅ |
 
-**70 tests, all passing in Debug and ReleaseSafe.** Every error path is
+**78 tests, all passing in Debug and ReleaseSafe.** Every error path is
 OOM-safe (verified via `std.testing.checkAllAllocationFailures`, which found
-and fixed ~9 real/latent leaks during phase reviews).
+and fixed ~10 real/latent leaks during reviews).
 
 **Property/theorem coverage (executable):** Thm 7 (soundness invariant),
 Thm 16 (LIFO revert), Thm 10/11 (monoid), Def 22 (reactive classification),
 Def 53 (provided-by), Def 54 / Thm 70 (ordering guard), Cor 69 (terminal
 recovery), Def 52 (instantiation cascade, transitive), Thm 80 (confluence /
 reconcile-endpoint = from-scratch load), Def 44/46/47 (commutativity witness,
-comptime-gated), §4.4 Failure (FAILED route), §5.2.2 HMR (fiber swap).
+comptime-gated AND enforced at load), §4.4 Failure (FAILED route), §5.2.2 HMR
+(fiber swap), Def 26/27 (interception merge, context-carried 𝜄).
 
 Run: `zig build test` (add `-Doptimize=ReleaseSafe` for the safe-optimized run).
+
+---
+
+## 🔍 Implementation vs. Plan — Fidelity Notes
+
+A post-implementation audit mapped every plan item to code. Summary of items
+that are **realized differently than the plan literally wrote**, or that are
+**intentionally not runtime-enforced**:
+
+| Plan item | Status | Note |
+|-----------|--------|------|
+| 1.2 Effect Composition `⋄` (Def 9) | Operational | No standalone `compose(f,g)` combinator; realized by `applySequence`/`execute` folding inverses. The monoid is exercised through sequence recovery (Thm 7/16) rather than a direct `⋄` law test. |
+| 1.4 Effect Lifting `effectΓ` (Def 12) | Operational | No named `effectΓ : 𝔈Γ → 𝔈∂Γ` function. The ∂²Γ recursion is realized by `Context.derive`'s parent-composition (a child's `dispose` is prepended to the parent's accumulator), tested via the parent→child cascade. |
+| 4.5 Confinement (Def 55) | **Not enforced** | The runtime does not restrict a fiber's writes to its declared `inject ∪ provide`. The paper itself treats confinement as a *discipline consequence* of the context-mediated iterator form, not a runtime check (§5.1.1: “an obligation on the component author rather than a property the runtime verifies”). A buggy component could write foreign keys. Enforcing it would require per-fiber write interposition on the store — deferred as out of scope. |
+| 6.2 Observational Equivalence `≃ₖ` (Def 31) | Conceptual | Represented as `CommutativityKind` (the *evidence* a key's equivalence rests on) rather than a runtime relation. Values compare by exact equality; `≃ₖ` is a design-time notion the witness documents. |
+| Eq. 46 (σ_γ = union over ACTIVE fibers) | Emulated | The physical store is a flat shared table, not a per-fiber-table union. The *satisfaction* layer emulates Eq. 46 exactly — `isProvided` requires `phase == .active`, so a loading/unloading provider's binding is not observable to dependents. `ctx.get` reads the flat store directly; the “not-yet-visible” invariant holds because the lifecycle gates *when* consumers run, not by structural partitioning. |
+| 3.4 `ctx.use` (Alg 4) | Named `Orchestrator.load` | Instantiation is driven by the orchestrator rather than a `ctx.use` method; the Def 52 cascade (child retire on parent unload) is wired via `retireChildren`. |
+
+Everything else in the plan is implemented as written and tested.
 
 ---
 
@@ -55,7 +75,7 @@ Run: `zig build test` (add `-Doptimize=ReleaseSafe` for the safe-optimized run).
 | 1.1 | **Witnessed Effect Function (`𝔈Γ*`)** | §3.1.2, Def 8 | `fn(ctx: *Context) !EffectResult` returning `{ new_ctx, inverse: fn(Context) void }` |
 | 1.2 | **Effect Composition (`⋄`)** | §3.1.2, Def 9 | Chains effects: `f ⋄ g = γ → let (δ,s)=g(γ); (ε,t)=f(δ) in (ε, s∘t)` |
 | 1.3 | **Effect Iterator (`ℑΓ`)** | §3.1.3, Def 17 | Generator yielding `{ δ, inverse, continuation? }` — maps to Zig `std.Iterator` |
-| 1.4 | **Effect Lifting (`effectΓ`)** | §3.1.2, Def 12 | Lifts `𝔈Γ → 𝔈∂Γ` — wraps callback to track inverses in parent accumulator |
+| 1.4 | **Effect Lifting (`effectΓ`)** | §3.1.2, Def 12 | ⚠️ Realized operationally via `Context.derive` parent-composition, not a named `effectΓ`. See Fidelity Notes. |
 | 1.5 | **`ctx.effect(callback, guard)`** | §5.1.1, Alg 1 | **Core primitive** — executes iterator, folds inverses, returns `dispose()` closure |
 
 ---
@@ -69,7 +89,7 @@ Run: `zig build test` (add `-Doptimize=ReleaseSafe` for the safe-optimized run).
 | 2.3 | **`ctx.get(key)` / `ctx.set(key, value)`** | §3.2.1, Def 20 | Read/write through realm indirection `ρ(k) → σ(ρ(k))` |
 | 2.4 | **Reactive Notification (`notify_d`)** | §3.2.2, Def 22 | Classifies transitions: *activating* / *deactivating* / *neutral* |
 | 2.5 | **Isolation (`ctx.isolate`)** | §3.2.3, Def 24–25 | Derives child context with overridden realm table `ρ[k ↦ r]` |
-| 2.6 | **Interception (`ctx.intercept`)** | §3.2.3, Def 26–27 | Merges metadata into `𝜄` — cross-cutting behavior on access |
+| 2.6 | **Interception (`ctx.intercept`)** | §3.2.3, Def 26–27 | ✅ `ctx.intercept(key, meta, merge, free)` merges into context-carried `𝜄` (right-biased); `ctx.interceptOf(key)` reads it. Per-context table, derived realization. |
 | 2.7 | **`notify(ctx, keys)`** | §5.1.2, Alg 3 | Propagates changes to dependent fibers, calls `refresh(fiber)` |
 
 ---
@@ -97,7 +117,7 @@ Run: `zig build test` (add `-Doptimize=ReleaseSafe` for the safe-optimized run).
 | 4.2 | **Orchestration Rules** | §4.2.1 | `O-Insert`, `O-Retire`, `O-Remove` — external API: `load`, `unload`, `replace` |
 | 4.3 | **Lifecycle Rules** | §4.2.2 | `L-Begin`, `L-Iter`, `L-Finish`, `L-Divert`, `L-Leave`, `L-Unload` — implemented in `refresh/reload/unload` |
 | 4.4 | **Guard (`¬relied_n`)** | §4.2.2, Def 54 | Blocks provider unload until all dependents deactivated |
-| 4.5 | **Confinement** | §4.2.3, Def 55 | Ensures fiber only reads/writes its declared `inject ∪ provide` keys |
+| 4.5 | **Confinement** | §4.2.3, Def 55 | ⚠️ NOT runtime-enforced (paper treats it as a discipline, not a check). See Fidelity Notes. |
 
 ---
 
@@ -117,8 +137,8 @@ Run: `zig build test` (add `-Doptimize=ReleaseSafe` for the safe-optimized run).
 |---|----------------|---------------|-------------|
 | 6.1 | **Coeffect Operations (`𝒜ₖ`)** | §3.3.1, Def 29 | Per-key operations with witness: `{ value_type, ops: []Op, commutativity_proof }` |
 | 6.2 | **Observational Equivalence (`≃ₖ`)** | §3.3.2, Def 31 | Indistinguishability under key's operations — for Zig: structural equality of exposed API |
-| 6.3 | **Commutativity Witness** | §3.4.2, Def 46 | Proof that `𝒜ₖ` ops commute — component author obligation, verified at key registration |
-| 6.4 | **Pairwise Independence** | §3.4.1, Def 42 | `P₁∩S₂ = P₂∩S₁ = ∅` ∨ shared keys commutative — enforced by `O-Insert` disjointness check |
+| 6.3 | **Commutativity Witness** | §3.4.2, Def 46 | ✅ `CommutativityWitness` on `Component.provide_witness`; comptime `assertCommutative` gate AND runtime enforcement in `load` (rejects non-commutative provisions). |
+| 6.4 | **Pairwise Independence** | §3.4.1, Def 42 | ✅ `P₁∩S₂ = P₂∩S₁ = ∅` enforced by registry single-source; shared-key commutativity reduces (Thm 45) to each provider's witness, checked at `load`. |
 
 ---
 
