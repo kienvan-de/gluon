@@ -84,6 +84,11 @@ pub const Evented = evented.Evented;
 pub const lifecycle = @import("component/lifecycle.zig");
 pub const Orchestrator = lifecycle.Orchestrator;
 
+// Test-only helpers (not part of the public API): the well-formedness
+// invariant checker and the randomized scheduler property test.
+const invariants = @import("testing/invariants.zig");
+const randomized = @import("testing/randomized.zig");
+
 test {
     // Pull in referenced modules' tests.
     _ = accumulator;
@@ -104,4 +109,6 @@ test {
     _ = loader;
     _ = schema;
     _ = key_registry;
+    _ = invariants;
+    _ = randomized;
 }

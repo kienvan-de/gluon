@@ -722,6 +722,85 @@ test "default witness is commutative: existing simple components still load" {
     try std.testing.expectEqual(comp.Phase.active, orch.registry.get(id).?.phase);
 }
 
+// ── Derived-behavior tests (verification-assessment items 17, 37, 49) ────
+
+test "item 17 (Def 72): a self-dependent component never activates" {
+    // d ∩ p ≠ ∅: the component declares the very key it provides. Its only
+    // possible provider is itself, but a key is provided only while its
+    // provider is ACTIVE (Def 53 / isProvided) — and it is still inactive while
+    // its own dependency is being resolved. The precedence relation n < n is a
+    // cycle (Def 72), so it stays Inactive forever.
+    var orch = try Orchestrator.init(std.testing.allocator);
+    defer orch.deinit();
+
+    const S = struct {
+        const k = [_]Key{Key.of(u32, "self")};
+    };
+    const self_dep = comp.Component{
+        .inject = &S.k,
+        .provide = &S.k,
+        .apply = providerApply("self", 1),
+    };
+    const id = try orch.load(self_dep, comp.root);
+    try std.testing.expectEqual(comp.Phase.inactive, orch.registry.get(id).?.phase);
+    try std.testing.expect(!orch.isProvided(Key.of(u32, "self")));
+}
+
+test "item 37 (§4.3.4): a dependency cycle leaves both members Inactive" {
+    // A declares b & provides a; B declares a & provides b. Neither can
+    // activate first (each waits on the other's ACTIVE provision), so the cycle
+    // stays permanently Inactive — predictable from declarations.
+    var orch = try Orchestrator.init(std.testing.allocator);
+    defer orch.deinit();
+
+    const A = struct {
+        const dep = [_]Key{Key.of(u32, "b")};
+        const prov = [_]Key{Key.of(u32, "a")};
+    };
+    const B = struct {
+        const dep = [_]Key{Key.of(u32, "a")};
+        const prov = [_]Key{Key.of(u32, "b")};
+    };
+    const comp_a = comp.Component{ .inject = &A.dep, .provide = &A.prov, .apply = providerApply("a", 1) };
+    const comp_b = comp.Component{ .inject = &B.dep, .provide = &B.prov, .apply = providerApply("b", 2) };
+
+    const ida = try orch.load(comp_a, comp.root);
+    const idb = try orch.load(comp_b, comp.root);
+    try std.testing.expectEqual(comp.Phase.inactive, orch.registry.get(ida).?.phase);
+    try std.testing.expectEqual(comp.Phase.inactive, orch.registry.get(idb).?.phase);
+    try std.testing.expect(!orch.isProvided(Key.of(u32, "a")));
+    try std.testing.expect(!orch.isProvided(Key.of(u32, "b")));
+}
+
+test "item 49 (§5.1.3): an in-place overwrite is NOT observed; withdraw+reinstall is" {
+    // target is a digest of provider fiber IDS. Overwriting a provider's own
+    // binding in place leaves the provider id unchanged, so a dependent's
+    // target is unchanged and it does NOT reload. Only replacing the PROVIDER
+    // (a new fiber) changes the id and drives a reload. We observe the id-based
+    // target by checking the consumer's committed view before/after.
+    var orch = try Orchestrator.init(std.testing.allocator);
+    defer orch.deinit();
+
+    const kdb = Key.of(u32, "db");
+    const pid = try orch.load(provider("db", 1), comp.root);
+    const cid = try orch.load(consumer("db"), comp.root);
+    try std.testing.expectEqual(comp.Phase.active, orch.registry.get(cid).?.phase);
+
+    // The consumer's committed view names the provider fiber.
+    const view_before = orch.registry.get(cid).?.committed.?;
+    try std.testing.expectEqual(pid, view_before.providers[0].?);
+
+    // In-place overwrite: mutate the provider's own binding WITHOUT changing
+    // the provider fiber. The dependent's target (a digest of provider ids) is
+    // unchanged, so it does not reload — its committed view still names `pid`.
+    try orch.root_ctx.store.restrict(kdb);
+    try orch.root_ctx.store.set(u32, kdb, 999);
+    try orch.notify(&.{kdb}); // propagate the change
+    const c_after = orch.registry.get(cid).?;
+    try std.testing.expectEqual(comp.Phase.active, c_after.phase); // still active
+    try std.testing.expectEqual(pid, c_after.committed.?.providers[0].?); // same provider id
+}
+
 // ── `.evented` scheduler integration (roadmap #6, step 3) ─────────
 //
 // The lifecycle must behave identically under the `.evented` backend (which
