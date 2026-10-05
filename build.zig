@@ -26,4 +26,21 @@ pub fn build(b: *std.Build) void {
     example_mod.addImport("gluon", gluon_mod);
     const example_tests = b.addTest(.{ .root_module = example_mod });
     test_step.dependOn(&b.addRunArtifact(example_tests).step);
+
+    // Hello-greeter end-to-end example: tested (deterministic, scripted IO) and
+    // runnable (`zig build run-hello`, uses real stdin/stdout).
+    const hello_mod = b.createModule(.{
+        .root_source_file = b.path("examples/hello_greeter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hello_mod.addImport("gluon", gluon_mod);
+    const hello_tests = b.addTest(.{ .root_module = hello_mod });
+    test_step.dependOn(&b.addRunArtifact(hello_tests).step);
+
+    const hello_exe = b.addExecutable(.{ .name = "hello-greeter", .root_module = hello_mod });
+    const run_hello = b.addRunArtifact(hello_exe);
+    if (b.args) |args| run_hello.addArgs(args);
+    const run_step = b.step("run-hello", "Run the hello-greeter example");
+    run_step.dependOn(&run_hello.step);
 }
