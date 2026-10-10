@@ -116,6 +116,41 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(c_printer_lib);
     ext_step.dependOn(&c_printer_lib.step);
 
+    // Zig greeter extension (.so / .dylib) — Pattern A: opaque service via store.
+    const zig_greeter_mod = b.createModule(.{
+        .root_source_file = b.path("examples/ext/ext_greeter.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    zig_greeter_mod.addImport("gluon_abi", gluon_abi_mod);
+    const zig_greeter_lib = b.addLibrary(.{
+        .name = "gluon_zig_greeter",
+        .linkage = .dynamic,
+        .root_module = zig_greeter_mod,
+    });
+    b.installArtifact(zig_greeter_lib);
+    ext_step.dependOn(&zig_greeter_lib.step);
+
+    // C greeter extension.
+    const c_greeter_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    c_greeter_mod.addCSourceFile(.{
+        .file = b.path("examples/ext/ext_greeter.c"),
+        .flags = &.{"-std=c99"},
+    });
+    c_greeter_mod.addIncludePath(b.path("include"));
+    c_greeter_mod.link_libc = true;
+    const c_greeter_lib = b.addLibrary(.{
+        .name = "gluon_c_greeter",
+        .linkage = .dynamic,
+        .root_module = c_greeter_mod,
+    });
+    b.installArtifact(c_greeter_lib);
+    ext_step.dependOn(&c_greeter_lib.step);
+
     // Integration test: actual ExtLoader.open with compiled .so files.
     // Lives under a SEPARATE step (test-ext) so `zig build test` doesn't
     // need to compile two shared libraries on every run.
@@ -123,6 +158,8 @@ pub fn build(b: *std.Build) void {
     const build_paths = b.addOptions();
     build_paths.addOptionPath("zig_printer_path", zig_printer_lib.getEmittedBin());
     build_paths.addOptionPath("c_printer_path",   c_printer_lib.getEmittedBin());
+    build_paths.addOptionPath("zig_greeter_path", zig_greeter_lib.getEmittedBin());
+    build_paths.addOptionPath("c_greeter_path",   c_greeter_lib.getEmittedBin());
 
     const ext_load_mod = b.createModule(.{
         .root_source_file = b.path("examples/ext/ext_load_test.zig"),
@@ -139,6 +176,8 @@ pub fn build(b: *std.Build) void {
     });
     ext_load_exe.step.dependOn(&zig_printer_lib.step);
     ext_load_exe.step.dependOn(&c_printer_lib.step);
+    ext_load_exe.step.dependOn(&zig_greeter_lib.step);
+    ext_load_exe.step.dependOn(&c_greeter_lib.step);
     const run_ext_load = b.addRunArtifact(ext_load_exe);
     run_ext_load.setCwd(b.path("."));
     const ext_test_step = b.step("test-ext", "Run ExtLoader integration tests (builds .so extensions)");

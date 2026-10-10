@@ -184,26 +184,77 @@ fn testMetadata(allocator: std.mem.Allocator, plugin_path: []const u8) !void {
 
 // ── Entry point ───────────────────────────────────────────────────
 
+// The GreeterService struct both the greeter .so and this host agree on.
+// In a real project this lives in a shared header; here it mirrors ext_greeter.*
+const GreeterService = extern struct {
+    greet: *const fn (name: [*:0]const u8) callconv(.c) void,
+};
+
+/// Pattern A: load a greeter extension, retrieve its opaque service from the
+/// coeffect store, and call through the function pointer directly.
+fn testDirectCall(allocator: std.mem.Allocator, greeter_path: []const u8, label: []const u8) !void {
+    std.debug.print("\n[{s}] opening {s}\n", .{ label, greeter_path });
+
+    var loader = ExtLoader.open(allocator, greeter_path) catch |err| {
+        std.debug.print("[{s}] ExtLoader.open skipped: {}\n", .{ label, err });
+        return;
+    };
+    defer loader.deinit();
+
+    var orch = try Orchestrator.init(allocator);
+    defer orch.deinit();
+
+    // Load the greeter — no inject deps, activates immediately.
+    const gr_id = try orch.loadWithConfig(
+        loader.pluginComponent(),
+        gluon.component.root,
+        loader.vtableConfig(),
+    );
+    expectEqual(gluon.Phase, gluon.Phase.active, orch.registry.get(gr_id).?.phase,
+        "greeter should be active");
+
+    // Read the opaque service from the coeffect store.
+    const svc_key = gluon.extServiceKey("greeter.service");
+    expect(orch.root_ctx.has(svc_key), "greeter.service should be in the store");
+    const ext_svc = try orch.root_ctx.get(*const gluon.ExtService, svc_key);
+
+    // Cast to the agreed-upon C struct and call through the function pointer.
+    const greeter: *const GreeterService = @ptrCast(@alignCast(ext_svc.ptr));
+    greeter.greet("ExtLoader");
+
+    // Unload — service withdrawn automatically by LIFO rollback.
+    try orch.unloadFiber(gr_id);
+    expect(!orch.root_ctx.has(svc_key), "greeter.service should be withdrawn");
+
+    std.debug.print("[{s}] OK\n", .{label});
+}
+
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     std.debug.print("=== ExtLoader integration tests ===\n", .{});
-    std.debug.print("Zig plugin path: {s}\n", .{paths.zig_printer_path});
-    std.debug.print("C   plugin path: {s}\n", .{paths.c_printer_path});
+    std.debug.print("Zig printer:  {s}\n", .{paths.zig_printer_path});
+    std.debug.print("C   printer:  {s}\n", .{paths.c_printer_path});
+    std.debug.print("Zig greeter:  {s}\n", .{paths.zig_greeter_path});
+    std.debug.print("C   greeter:  {s}\n", .{paths.c_greeter_path});
 
-    // Test 1: Zig plugin — full load/emit/unload cycle.
+    // Pattern B — EventBus emit/subscribe.
     try testLoadAndEmit(allocator, paths.zig_printer_path, "zig_printer");
-
-    // Test 2: C plugin — same lifecycle, different language.
     try testLoadAndEmit(allocator, paths.c_printer_path, "c_printer");
 
-    // Test 3: Ext waits for its inject dependency (spatial composability).
+    // Spatial composability.
     try testInactiveUntilBus(allocator, paths.zig_printer_path);
 
-    // Test 4: Metadata is read correctly from the .so.
+    // Metadata read from .so.
     try testMetadata(allocator, paths.zig_printer_path);
+
+    // Pattern A — direct call via opaque service (Zig greeter).
+    try testDirectCall(allocator, paths.zig_greeter_path, "zig_greeter");
+
+    // Pattern A — direct call via opaque service (C greeter).
+    try testDirectCall(allocator, paths.c_greeter_path, "c_greeter");
 
     if (failed) {
         std.debug.print("\n=== SOME TESTS FAILED ===\n", .{});
