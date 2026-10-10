@@ -84,6 +84,24 @@ pub const Evented = evented.Evented;
 pub const lifecycle = @import("component/lifecycle.zig");
 pub const Orchestrator = lifecycle.Orchestrator;
 
+// Dynamic plugin support (C ABI, dlopen/dlclose).
+pub const ext = struct {
+    pub const gluon_abi = @import("ext/gluon_abi.zig");
+    pub const host = @import("ext/host.zig");
+    pub const loader = @import("ext/loader.zig");
+};
+pub const GluonExtMeta = ext.gluon_abi.GluonExtMeta;
+pub const GluonExtHandle = ext.gluon_abi.GluonExtHandle;
+pub const GluonExtVTable = ext.gluon_abi.GluonExtVTable;
+pub const GluonHostApi = ext.gluon_abi.GluonHostApi;
+pub const GluonSubToken = ext.gluon_abi.GluonSubToken;
+pub const GluonHandlerFn = ext.gluon_abi.GluonHandlerFn;
+pub const GluonFreeFn = ext.gluon_abi.GluonFreeFn;
+pub const ExtService = ext.gluon_abi.ExtService;
+pub const extServiceKey = ext.host.extServiceKey;
+pub const ExtLoader = ext.loader.ExtLoader;
+pub const ext_bus_key = ext.host.ext_bus_key;
+
 // Test-only helpers (not part of the public API): the well-formedness
 // invariant checker and the randomized scheduler property test.
 const invariants = @import("testing/invariants.zig");
@@ -111,4 +129,7 @@ test {
     _ = key_registry;
     _ = invariants;
     _ = randomized;
+    _ = ext.gluon_abi;
+    _ = ext.host;
+    _ = ext.loader;
 }
