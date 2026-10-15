@@ -7,8 +7,8 @@ Building, testing, and the internals of Gluon.
 ## Build & test
 
 ```sh
-zig build test        # unit + integration tests (175 tests, no dlopen)
-zig build test-ext    # dynamic-plugin tests: builds .so/.dylib, loads via dlopen
+zig build test        # unit + integration tests (179 tests, no dlopen)
+zig build test-ext    # dynamic-plugin tests: builds .so/.dylib, loads via dlopen (macOS verified)
 zig build run-hello   # run the hello-greeter example against real stdin/stdout
 zig build ext-plugins # build the example plugin shared libraries
 ```

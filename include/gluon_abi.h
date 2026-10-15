@@ -61,7 +61,7 @@ extern "C" {
 /* ── Version ─────────────────────────────────────────────────────── */
 
 /** Increment when the ABI changes in a backward-incompatible way. */
-#define GLUON_ABI_VERSION 2
+#define GLUON_ABI_VERSION 1
 
 /* ── Forward declarations ─────────────────────────────────────────── */
 
@@ -99,9 +99,9 @@ typedef void (*GluonFreeFn)(void* ptr);
 /* ── Commutativity declaration ────────────────────────────────────── */
 
 /**
- * Commutativity hint a plugin declares for its provided keys (ABI v2).
+ * Commutativity hint a plugin declares for its provided keys.
  * Used in GluonExtMeta.commutativity. Matches GluonCommutativity in
- * src/ext/gluon_abi.zig. Set to 0 (trivial) for backward compatibility.
+ * src/ext/gluon_abi.zig. Set to 0 (trivial) if no ordering constraints apply.
  *
  * Gluon's Theorem 47 check rejects non-commutative provisions at load time
  * unless the plugin opts into explicit ordering — same rule as native components.
@@ -141,9 +141,9 @@ struct GluonExtMeta {
     const char* const* provide;
 
     /**
-     * Commutativity declaration for the provided keys (ABI v2, finding H4).
-     * Set to GLUON_COMMUTATIVE_TRIVIAL (0) for backward compatibility with
-     * ABI v1 plugins. Gluon reads this to enforce the Theorem 47 precondition:
+     * Commutativity declaration for the provided keys.
+     * Set to GLUON_COMMUTATIVE_TRIVIAL (0) if the plugin has no ordering
+     * constraints. Gluon reads this to enforce the Theorem 47 precondition:
      * a plugin declaring GLUON_NON_COMMUTATIVE will be rejected at load.
      * Old plugins that don't set this field get 0 (trivial) by zero-init.
      */

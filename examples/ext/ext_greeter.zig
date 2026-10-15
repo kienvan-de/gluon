@@ -32,9 +32,7 @@ const META = abi.GluonExtMeta{
 
 fn greetImpl(name: [*:0]const u8) callconv(.c) void {
     const n = std.mem.span(name);
-    _ = std.c.write(1, "[zig_ext_greeter] Hello, ", 24);
-    _ = std.c.write(1, n.ptr, n.len);
-    _ = std.c.write(1, "!\n", 2);
+    std.debug.print("[zig_ext_greeter] Hello, {s}!\n", .{n});
 }
 
 const GREETER_SVC = GreeterService{ .greet = greetImpl };

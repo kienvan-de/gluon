@@ -36,9 +36,7 @@ const PrinterHandle = struct {
 
 fn onPrint(_: ?*anyopaque, json: [*:0]const u8) callconv(.c) void {
     const msg = std.mem.span(json);
-    _ = std.c.write(1, "[zig_ext_printer] ", 18);
-    _ = std.c.write(1, msg.ptr, msg.len);
-    _ = std.c.write(1, "\n", 1);
+    std.debug.print("[zig_ext_printer] {s}\n", .{msg});
 }
 
 // ── Vtable ────────────────────────────────────────────────────────

@@ -1,0 +1,15 @@
+.{
+    .name = .gluon,
+    .version = "0.1.0",
+    .fingerprint = 0x86958577d0dfa66f,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "include",
+        "examples",
+        "LICENSE",
+    },
+}

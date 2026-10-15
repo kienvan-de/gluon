@@ -70,11 +70,15 @@ pub const GluonExtMeta = extern struct {
     /// Null-terminated array of null-terminated C strings.
     provide: [*:null]const ?[*:0]const u8,
     /// Commutativity declaration for the provided keys (finding H4).
-    /// 0 = trivial (default, backward-compatible with ABI v1 plugins).
+    /// 0 = trivial (default; zero-initialized metas read as trivial).
     commutativity: GluonCommutativity = .trivial,
 };
 
 // ── Ext handle ─────────────────────────────────────────────────
+
+/// ABI version. Mirrors `GLUON_ABI_VERSION` in include/gluon_abi.h.
+/// Bump on any backward-incompatible change to the structs or symbols above.
+pub const GLUON_ABI_VERSION: u32 = 1;
 
 /// Opaque handle returned by activate(). Gluon stores and forwards it.
 /// Cast to your own struct type inside activate/deactivate.

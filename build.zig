@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ext_ex_mod.addImport("gluon", gluon_mod);
+    ext_ex_mod.link_libc = true; // ext_example uses std.heap.c_allocator
     const ext_ex_tests = b.addTest(.{ .root_module = ext_ex_mod });
     test_step.dependOn(&b.addRunArtifact(ext_ex_tests).step);
 

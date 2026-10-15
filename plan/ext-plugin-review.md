@@ -104,7 +104,7 @@ field added to `GluonExtMeta` (default `.trivial` = 0, backward-compatible with
 ABI v1 plugins). `loader.zig` translates it via `witnessFromMeta()` into
 `Extension.provide_witness`; unknown future values map conservatively to
 `.non_commutative`. C header updated with `GluonCommutativity` enum + field;
-`GLUON_ABI_VERSION` bumped to 2.
+`GLUON_ABI_VERSION` is 1 (the first released ABI; the commutativity field is part of v1).
 
 ---
 
