@@ -229,6 +229,7 @@ fn pluginFromVtable(allocator: std.mem.Allocator, vtable: *const GluonExtVTable)
         .vtable = vtable,
         .inject_keys = inject_keys,
         .provide_keys = provide_keys,
+        .provide_witness = ext_loader.witnessFromMeta(meta.commutativity),
     };
 }
 

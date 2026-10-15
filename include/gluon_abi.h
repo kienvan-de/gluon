@@ -61,7 +61,7 @@ extern "C" {
 /* ── Version ─────────────────────────────────────────────────────── */
 
 /** Increment when the ABI changes in a backward-incompatible way. */
-#define GLUON_ABI_VERSION 1
+#define GLUON_ABI_VERSION 2
 
 /* ── Forward declarations ─────────────────────────────────────────── */
 
@@ -96,6 +96,23 @@ typedef void (*GluonHandlerFn)(void* state, const char* json);
  */
 typedef void (*GluonFreeFn)(void* ptr);
 
+/* ── Commutativity declaration ────────────────────────────────────── */
+
+/**
+ * Commutativity hint a plugin declares for its provided keys (ABI v2).
+ * Used in GluonExtMeta.commutativity. Matches GluonCommutativity in
+ * src/ext/gluon_abi.zig. Set to 0 (trivial) for backward compatibility.
+ *
+ * Gluon's Theorem 47 check rejects non-commutative provisions at load time
+ * unless the plugin opts into explicit ordering — same rule as native components.
+ */
+typedef enum {
+    GLUON_COMMUTATIVE_TRIVIAL        = 0, /**< Pure value; trivially commutative. */
+    GLUON_COMMUTATIVE_TAGGED_REGISTRY = 1, /**< Tagged-registry (unique-tag entries). */
+    GLUON_COMMUTATIVE_OBSERVATIONAL  = 2, /**< Observational commutativity. */
+    GLUON_NON_COMMUTATIVE            = 3, /**< Order-sensitive; load will be rejected. */
+} GluonCommutativity;
+
 /* ── Ext metadata ──────────────────────────────────────────────── */
 
 /**
@@ -122,7 +139,32 @@ struct GluonExtMeta {
      * Example: static const char* provide[] = {"greeter.service", NULL};
      */
     const char* const* provide;
+
+    /**
+     * Commutativity declaration for the provided keys (ABI v2, finding H4).
+     * Set to GLUON_COMMUTATIVE_TRIVIAL (0) for backward compatibility with
+     * ABI v1 plugins. Gluon reads this to enforce the Theorem 47 precondition:
+     * a plugin declaring GLUON_NON_COMMUTATIVE will be rejected at load.
+     * Old plugins that don't set this field get 0 (trivial) by zero-init.
+     */
+    GluonCommutativity commutativity;
 };
+
+/* ── Threading contract ───────────────────────────────────────────── */
+
+/**
+ * All GluonHostApi calls are SINGLE-THREADED and SYNCHRONOUS (finding M9).
+ *
+ * The Gluon host (EventBus, coeffect store, accumulator) has no internal
+ * locks. A plugin MUST only call host functions (subscribe, emit,
+ * provide_opaque, withdraw_opaque) from the thread that invoked activate()
+ * or deactivate(). Calling host functions from a background thread is
+ * undefined behaviour.
+ *
+ * If a plugin spawns threads, it must complete all host interactions before
+ * returning from activate(), and must ensure its threads do not call any
+ * host function during or after deactivate().
+ */
 
 /* ── Host API ─────────────────────────────────────────────────────── */
 

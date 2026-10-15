@@ -26,11 +26,19 @@
 //!
 //! The `ExtLoader` owns the `std.DynLib` handle (keeps the `.so` mapped).
 //! Unloading the component does NOT dlclose the library — the vtable pointer
-//! must remain valid. Call `ExtLoader.deinit()` to dlclose.
+//! must remain valid for the lifetime of any active fiber. Call
+//! `ExtLoader.deinit()` to dlclose AFTER all fibers have been unloaded and
+//! removed (M6 known limitation: the mapping is never reclaimed automatically,
+//! so hot-swapping a recompiled `.so` requires explicit deinit + re-open).
+//!
+//! To safely dlclose in the future: reference-count live fibers per loader and
+//! call `lib.close()` when the count reaches zero after the last fiber's LIFO
+//! rollback has run. The vtable-pointer validity requirement gates this.
 //!
 //! The injected/provided key slices are read from the plugin's static metadata
-//! at load time and stored in the `Extension` struct (which outlives the
-//! Component while the loader is alive).
+//! at load time, DUPED into host-owned memory (`keysFromCList` allocates), and
+//! stored in the `Extension` struct. Key names no longer borrow the plugin's
+//! static strings (M7 fix: host lifetime is independent of plugin storage).
 
 const std = @import("std");
 const abi = @import("gluon_abi.zig");
@@ -63,8 +71,21 @@ pub const Extension = struct {
     inject_keys: []Key,
     /// Gluon Key slices built from the plugin's meta.provide strings.
     provide_keys: []Key,
+    /// Commutativity witness read from meta.commutativity (finding H4).
+    /// Replaces the old fabricated `.trivial` hardcode so the lifecycle's
+    /// Theorem 47 check (loadWithConfig) actually enforces what the plugin
+    /// declares, rather than waving every plugin through unconditionally.
+    provide_witness: @import("../coeffect/key_registry.zig").CommutativityWitness,
+    /// Stable config bundle passed to dynApply via loadWithConfig. Holds the
+    /// vtable pointer and provide_keys slice so dynApply can wire both into
+    /// the HostBridge (provide_keys feeds the H3 undeclared-key guard).
+    /// Address is stable because Extension is heap-stable inside ExtLoader.
+    dyn_config: DynConfig = undefined,
 
     pub fn deinit(self: *Extension) void {
+        // Free the duped key name strings (M7 fix: keysFromCList now owns them).
+        for (self.inject_keys) |k| self.allocator.free(k.name);
+        for (self.provide_keys) |k| self.allocator.free(k.name);
         self.allocator.free(self.inject_keys);
         self.allocator.free(self.provide_keys);
     }
@@ -77,13 +98,17 @@ pub const Extension = struct {
             .inject = self.inject_keys,
             .provide = self.provide_keys,
             .apply = dynApply,
-            .provide_witness = .{ .kind = .trivial, .justification = "dynamic plugin: trivial value provision" },
+            // H4 fix: use the witness read from meta, not a fabricated .trivial.
+            .provide_witness = self.provide_witness,
         };
     }
 
-    /// Returns the vtable pointer as a `?*anyopaque` for `loadWithConfig`.
-    pub fn vtableConfig(self: *const Extension) ?*anyopaque {
-        return @constCast(self.vtable);
+    /// Returns a pointer to the stable DynConfig as a `?*anyopaque` suitable
+    /// for `Orchestrator.loadWithConfig`'s `config` parameter.
+    /// The DynConfig bundles vtable + provide_keys for dynApply.
+    pub fn vtableConfig(self: *Extension) ?*anyopaque {
+        self.dyn_config = .{ .vtable = self.vtable, .provide_keys = self.provide_keys };
+        return &self.dyn_config;
     }
 };
 
@@ -105,18 +130,29 @@ const ExtIterState = struct {
     next_ran: bool = false,
 };
 
+/// Type-erased config passed from the host to dynApply via loadWithConfig.
+/// Bundles the vtable and the declared provide_keys slice so dynApply can
+/// wire both into the HostBridge (provide_keys feeds the H3 guard).
+/// Owned by Extension; its address is stable for the lifetime of the loader.
+pub const DynConfig = struct {
+    vtable: *const GluonExtVTable,
+    provide_keys: []const Key,
+};
+
 fn dynApply(ctx: *Context, config: ?*anyopaque) anyerror!Context.Iterator {
-    // config carries a *const GluonExtVTable.
-    const vtable: *const GluonExtVTable = @ptrCast(@alignCast(config.?));
+    // config carries a *const DynConfig (vtable + declared provide_keys).
+    const dc: *const DynConfig = @ptrCast(@alignCast(config.?));
 
     const Iter = struct {
-        fn make(a: std.mem.Allocator, vt: *const GluonExtVTable, c: *Context) !Context.Iterator {
+        fn make(a: std.mem.Allocator, d: *const DynConfig, c: *Context) !Context.Iterator {
             const st = try a.create(ExtIterState);
             errdefer a.destroy(st);
 
             const bridge = try a.create(HostBridge);
             errdefer a.destroy(bridge);
-            bridge.* = .{ .ctx = c, .allocator = a };
+            // Pass the declared provide_keys so cProvideOpaque can enforce
+            // that the plugin only writes keys it declared (H3 guard).
+            bridge.* = .{ .ctx = c, .allocator = a, .declared_provide = d.provide_keys };
 
             // Heap-allocate the host API so the plugin can safely store its
             // address in its handle for use during deactivate.
@@ -124,7 +160,7 @@ fn dynApply(ctx: *Context, config: ?*anyopaque) anyerror!Context.Iterator {
             errdefer a.destroy(host_api);
             host_api.* = bridge.hostApi();
 
-            st.* = .{ .vtable = vt, .bridge = bridge, .host_api = host_api };
+            st.* = .{ .vtable = d.vtable, .bridge = bridge, .host_api = host_api };
             return .{ .state = st, .next_fn = next, .deinit_fn = deinit };
         }
 
@@ -190,7 +226,7 @@ fn dynApply(ctx: *Context, config: ?*anyopaque) anyerror!Context.Iterator {
         }
     };
 
-    return Iter.make(ctx.allocator, vtable, ctx);
+    return Iter.make(ctx.allocator, dc, ctx);
 }
 
 // ── ExtLoader ─────────────────────────────────────────────────────
@@ -230,6 +266,11 @@ pub const ExtLoader = struct {
         const provide_keys = keysFromCList(allocator, meta.provide) catch
             return LoadError.OutOfMemory;
 
+        // H4 fix: translate the plugin's declared commutativity into a witness
+        // so loadWithConfig's Theorem 47 check applies to plugins the same way
+        // it applies to native components (no more fabricated .trivial for all).
+        const witness = witnessFromMeta(meta.commutativity);
+
         return .{
             .allocator = allocator,
             .lib = lib,
@@ -238,6 +279,7 @@ pub const ExtLoader = struct {
                 .vtable = vtable,
                 .inject_keys = inject_keys,
                 .provide_keys = provide_keys,
+                .provide_witness = witness,
             },
         };
     }
@@ -258,14 +300,36 @@ pub const ExtLoader = struct {
         return self.plugin.component();
     }
 
-    /// Returns the vtable pointer as a `?*anyopaque` suitable for
-    /// `Orchestrator.loadWithConfig`'s `config` parameter.
-    pub fn vtableConfig(self: *const ExtLoader) ?*anyopaque {
-        return @constCast(self.plugin.vtable);
+    /// Returns a pointer to the stable DynConfig as `?*anyopaque` for
+    /// `Orchestrator.loadWithConfig`. Delegates to `plugin.vtableConfig()`.
+    pub fn vtableConfig(self: *ExtLoader) ?*anyopaque {
+        return self.plugin.vtableConfig();
     }
 };
 
 // ── Helpers ───────────────────────────────────────────────────────
+
+const CommutativityWitness = @import("../coeffect/key_registry.zig").CommutativityWitness;
+const CommutativityKind = @import("../coeffect/key_registry.zig").CommutativityKind;
+
+/// Translate a plugin's declared `GluonCommutativity` into a host-side
+/// `CommutativityWitness` (H4 fix). Unknown values (future ABI additions)
+/// are treated conservatively as `.non_commutative` so the load is rejected
+/// rather than silently waved through.
+pub fn witnessFromMeta(c: abi.GluonCommutativity) CommutativityWitness {
+    return switch (c) {
+        .trivial => .{ .kind = .trivial,
+                       .justification = "dynamic plugin declared trivial commutativity" },
+        .tagged_registry => .{ .kind = .tagged_registry,
+                               .justification = "dynamic plugin declared tagged-registry commutativity" },
+        .observational => .{ .kind = .observational,
+                             .justification = "dynamic plugin declared observational commutativity" },
+        .non_commutative => .{ .kind = .non_commutative,
+                               .justification = "dynamic plugin declared non-commutative provision" },
+        _ => .{ .kind = .non_commutative,
+                .justification = "dynamic plugin declared unknown commutativity — conservatively rejected" },
+    };
+}
 
 /// Convert a null-terminated array of C strings to Gluon Keys.
 /// Exported so `ext_example.zig` can build Extensions from inline vtables
@@ -279,8 +343,14 @@ pub fn keysFromCList(
     while (list[n] != null) : (n += 1) {}
 
     const keys = try allocator.alloc(Key, n);
+    errdefer allocator.free(keys);
+
+    // M7 fix: dupe each key name into host-owned memory so the Key slices
+    // remain valid regardless of the plugin's storage lifetime. Previously the
+    // names were borrowed (std.mem.span), leaving Key.name dangling if the
+    // plugin's static strings moved or were freed.
     for (0..n) |i| {
-        const name = abi.cStrSlice(list[i].?);
+        const name = try allocator.dupe(u8, abi.cStrSlice(list[i].?));
         keys[i] = host_mod.extServiceKey(name);
     }
     return keys;
@@ -296,7 +366,11 @@ test "keysFromCList converts null-terminated C string list to Key slice" {
     // Static null-terminated array.
     const list = [_:null]?[*:0]const u8{ "foo", "bar", null };
     const keys = try keysFromCList(allocator, &list);
-    defer allocator.free(keys);
+    // M7 fix: keysFromCList now dupes key names; free them before the slice.
+    defer {
+        for (keys) |k| allocator.free(k.name);
+        allocator.free(keys);
+    }
 
     try std.testing.expectEqual(@as(usize, 2), keys.len);
     try std.testing.expectEqualStrings("foo", keys[0].name);
@@ -307,7 +381,7 @@ test "keysFromCList handles empty list" {
     const allocator = std.testing.allocator;
     const list = [_:null]?[*:0]const u8{null};
     const keys = try keysFromCList(allocator, &list);
-    defer allocator.free(keys);
+    defer allocator.free(keys); // empty: no names to free
     try std.testing.expectEqual(@as(usize, 0), keys.len);
 }
 
@@ -331,6 +405,7 @@ test "Extension.component returns Component with correct inject/provide lengths"
         .vtable = &fakeVtable,
         .inject_keys = inject_keys,
         .provide_keys = provide_keys,
+        .provide_witness = CommutativityWitness.trivial(),
     };
     defer plugin.deinit();
 
@@ -339,4 +414,63 @@ test "Extension.component returns Component with correct inject/provide lengths"
     try std.testing.expectEqual(@as(usize, 1), c.provide.len);
     try std.testing.expectEqualStrings("dep.a", c.inject[0].name);
     try std.testing.expectEqualStrings("svc.b", c.provide[0].name);
+    // H4: witness is forwarded from Extension to Component.
+    try std.testing.expectEqual(CommutativityKind.trivial, c.provide_witness.kind);
+}
+
+test "H4: witnessFromMeta translates all GluonCommutativity variants correctly" {
+    const W = witnessFromMeta;
+    try std.testing.expectEqual(CommutativityKind.trivial,         W(.trivial).kind);
+    try std.testing.expectEqual(CommutativityKind.tagged_registry, W(.tagged_registry).kind);
+    try std.testing.expectEqual(CommutativityKind.observational,   W(.observational).kind);
+    try std.testing.expectEqual(CommutativityKind.non_commutative, W(.non_commutative).kind);
+    // Unknown future values map conservatively to non_commutative.
+    try std.testing.expectEqual(CommutativityKind.non_commutative,
+        W(@enumFromInt(99)).kind);
+}
+
+test "H3: cProvideOpaque rejects keys not declared in meta.provide" {
+    // Builds an Extension with provide_keys = ["svc.declared"] and confirms that
+    // the H3 guard inside cProvideOpaque returns -1 for "svc.undeclared".
+    const allocator = std.testing.allocator;
+
+    // Minimal vtable for this test (activate/deactivate won't be called).
+    const fakeVtable = GluonExtVTable{ .meta = undefined, .activate = undefined, .deactivate = undefined };
+
+    const provide_list = [_:null]?[*:0]const u8{ "svc.declared", null };
+    const provide_keys = try keysFromCList(allocator, &provide_list);
+    var plugin = Extension{
+        .allocator = allocator,
+        .vtable = &fakeVtable,
+        .inject_keys = try allocator.alloc(Key, 0),
+        .provide_keys = provide_keys,
+        .provide_witness = CommutativityWitness.trivial(),
+    };
+    defer plugin.deinit();
+
+    const ctx = try Context.init(allocator);
+    defer ctx.deinit();
+
+    const bridge = try allocator.create(host_mod.HostBridge);
+    defer allocator.destroy(bridge);
+    bridge.* = .{
+        .ctx = ctx,
+        .allocator = allocator,
+        .declared_provide = plugin.provide_keys,
+    };
+    const api = bridge.hostApi();
+
+    var dummy: u32 = 1;
+
+    // Declared key → accepted (returns 0).
+    const rc_ok = api.provide_opaque(api.ctx, "svc.declared", &dummy, null);
+    try std.testing.expectEqual(@as(c_int, 0), rc_ok);
+
+    // Undeclared key → rejected (returns -1, no store write).
+    const rc_bad = api.provide_opaque(api.ctx, "svc.undeclared", &dummy, null);
+    try std.testing.expectEqual(@as(c_int, -1), rc_bad);
+    const undeclared_key = host_mod.extServiceKey("svc.undeclared");
+    try std.testing.expect(!ctx.has(undeclared_key));
+
+    ctx.dispose.recover(ctx);
 }

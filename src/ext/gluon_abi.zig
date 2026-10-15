@@ -10,6 +10,16 @@
 //! This file has NO imports from Gluon host internals (no store, no context,
 //! no lifecycle) so it compiles cleanly into a plugin shared library.
 //! Host-side utilities that need Gluon internals live in host.zig.
+//!
+//! ## Threading contract (M9)
+//!
+//! All GluonHostApi calls are **single-threaded and synchronous**. The Gluon
+//! host (EventBus, coeffect store, accumulator) has no internal locks. A plugin
+//! MUST only call host functions (subscribe, emit, provide_opaque, …) from the
+//! thread that called activate() or deactivate(). Calling host functions from
+//! a background thread is undefined behaviour. If a plugin spawns threads, it
+//! must complete all host interactions before returning from activate(), and
+//! must stop its threads before calling any host function from deactivate().
 
 const std = @import("std");
 
@@ -32,6 +42,21 @@ pub const GluonFreeFn = *const fn (ptr: *anyopaque) callconv(.c) void;
 
 // ── Ext metadata ───────────────────────────────────────────────
 
+/// Commutativity hint a plugin declares for its provided keys (finding H4).
+/// Matches `GluonCommutativity` in the C header. Zero = trivial (default,
+/// backward-compatible); non-zero values tighten the Theorem 47 check.
+pub const GluonCommutativity = enum(u8) {
+    /// Pure value / no operations beyond get-set: trivially commutative.
+    trivial = 0,
+    /// Tagged-registry (each entry carries a unique tag; registrations commute).
+    tagged_registry = 1,
+    /// Observational (hidden internal state; scalable commutativity rule).
+    observational = 2,
+    /// Non-commutative: operations are order-sensitive. Gluon will reject load.
+    non_commutative = 3,
+    _,
+};
+
 /// Metadata a plugin declares about its coeffect interface.
 /// Returned by GluonExtVTable.meta once after dlopen.
 /// All pointers must remain valid for the process lifetime (static data).
@@ -44,12 +69,24 @@ pub const GluonExtMeta = extern struct {
     /// Keys this plugin PROVIDES when active.
     /// Null-terminated array of null-terminated C strings.
     provide: [*:null]const ?[*:0]const u8,
+    /// Commutativity declaration for the provided keys (finding H4).
+    /// 0 = trivial (default, backward-compatible with ABI v1 plugins).
+    commutativity: GluonCommutativity = .trivial,
 };
 
 // ── Ext handle ─────────────────────────────────────────────────
 
 /// Opaque handle returned by activate(). Gluon stores and forwards it.
 /// Cast to your own struct type inside activate/deactivate.
+///
+/// ## Null convention (L10 known limitation)
+///
+/// `activate` returning null signals failure; a plugin with no private state
+/// cannot return a valid null handle. Plugins must allocate a minimal sentinel
+/// struct (e.g. a zero-byte or single-bool handle) to satisfy the non-null
+/// requirement. A future revision could introduce a dedicated
+/// `GluonActivateResult` enum to separate the failure signal from the handle
+/// value, but that is a breaking ABI change.
 pub const GluonExtHandle = opaque {};
 
 // ── Host API ──────────────────────────────────────────────────────
@@ -120,8 +157,21 @@ pub const VTABLE_SYMBOL = "gluon_plugin_vtable";
 pub const ExtService = struct {
     ptr: *anyopaque,
     free_fn: ?GluonFreeFn,
+    /// Whether this service is still live (provisioned and not yet freed).
+    /// Guards against freeing twice: an explicit `withdraw_opaque` and the
+    /// provision's tracked LIFO inverse both route through `free`, and only
+    /// the first call runs `free_fn`. Also false until the store binding is
+    /// actually installed, so a provision that fails before `store.set` never
+    /// runs `free_fn` on recover (finding M8).
+    live: bool = false,
 
-    pub fn free(self: *const ExtService) void {
+    /// Run the plugin's `free_fn(ptr)` exactly once over this service's life.
+    /// Idempotent: subsequent calls (e.g. the rollback inverse after an
+    /// explicit withdraw) are no-ops. Requires `*ExtService` so it can clear
+    /// the `live` flag; both callers hold the same underlying allocation.
+    pub fn free(self: *ExtService) void {
+        if (!self.live) return;
+        self.live = false;
         if (self.free_fn) |f| f(self.ptr);
     }
 };
