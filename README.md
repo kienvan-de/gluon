@@ -82,7 +82,7 @@ Add `gluon` to your `build.zig.zon`:
 .dependencies = .{
     .gluon = .{
         .url = "https://github.com/kienvan-de/gluon/archive/refs/tags/v0.1.1.tar.gz",
-        .hash = "gluon-0.1.0-b6bf0DPzBgB49GM6xsi1EDyAzxeuharE-J3iUb82cXng",
+        .hash = "gluon-0.1.1-b6bf0DPzBgC22_txGmplQ0o0AkyUF5xrABjCub8N3Kpy",
     },
 },
 ```
