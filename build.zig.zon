@@ -1,6 +1,6 @@
 .{
     .name = .gluon,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0x86958577d0dfa66f,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
