@@ -169,6 +169,9 @@ pub fn build(b: *std.Build) void {
     });
     ext_load_mod.addImport("gluon", gluon_mod);
     ext_load_mod.addOptions("build_paths", build_paths);
+    // Without libc, std.DynLib on Linux uses Zig's own ELF loader, which
+    // cannot relocate these plugins (segfaults). Link libc to use dlopen.
+    ext_load_mod.link_libc = true;
     // Build as a standalone executable (not under --listen=- IPC), because
     // dlopen inside the Zig 0.17 test runner IPC loop deadlocks on macOS.
     const ext_load_exe = b.addExecutable(.{

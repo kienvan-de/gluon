@@ -230,7 +230,12 @@ fn testDirectCall(allocator: std.mem.Allocator, greeter_path: []const u8, label:
 }
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    // stack_trace_frames = 0: Zig 0.17's Linux DWARF unwinder mis-parses the
+    // .eh_frame of clang-compiled C plugins, so any DebugAllocator allocation
+    // that happens while a C plugin frame is on the stack segfaults in the
+    // unwinder (not in gluon). Disabling trace capture keeps leak detection
+    // (DebugAllocator still tracks leaks) while avoiding the unwinder walk.
+    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

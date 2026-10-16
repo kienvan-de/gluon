@@ -60,7 +60,7 @@ See [`examples/`](examples/) for complete, runnable programs:
 | [`hello_greeter.zig`](examples/hello_greeter.zig) | end-to-end: dependency ordering, provider swap, host I/O |
 | [`pattern_a_service.zig`](examples/pattern_a_service.zig) | sharing a service between components via the coeffect store |
 | [`pattern_b_eventbus.zig`](examples/pattern_b_eventbus.zig) | pub/sub between components via the EventBus |
-| [`examples/ext/`](examples/ext/) | **dynamic plugins** — load `.so`/`.dll`/`.dylib` at runtime via a C ABI |
+| [`examples/ext/`](examples/ext/) | **dynamic plugins** — load `.so`/`.dylib` at runtime via a C ABI (verified on macOS and Linux; Windows untested) |
 
 ---
 
